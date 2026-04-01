@@ -3406,6 +3406,231 @@ class WikiTopicsMT4(WikiTopics):
 
     def __init__(self, **kwargs):
         super(WikiTopicsMT4, self).__init__(**kwargs)
+class Atlas(InMemoryDataset):
+    name = "Atlas"
+
+    def __init__(
+        self,
+        root,
+        transform=None,
+        pre_transform=None,
+        dataset_name=None,
+        dataset_version=None,
+        split_seed=42,
+        **kwargs,
+    ):
+        # Expected dataset_version format: "small:0" / "small:1" / "one_hop:12"
+        version = str(dataset_version or "small:0").strip()
+        if ":" not in version:
+            raise ValueError(
+                f"Atlas dataset_version must be '<graph>:<index>', got: {version}. "
+                "Example: small:0"
+            )
+        graph_name, idx_str = version.split(":", 1)
+        graph_name = graph_name.strip()
+        idx_str = idx_str.strip()
+        if graph_name not in {"small", "one_hop"}:
+            raise ValueError(f"Unknown Atlas graph type: {graph_name}. Use 'small' or 'one_hop'.")
+        try:
+            graph_idx = int(idx_str)
+        except ValueError as e:
+            raise ValueError(f"Invalid Atlas graph index in dataset_version: {version}") from e
+
+        self.dataset_name = dataset_name or "Atlas"
+        self.dataset_version = version
+        self.graph_name = graph_name
+        self.graph_idx = graph_idx
+        self.split_seed = int(split_seed)
+
+        super().__init__(root, transform, pre_transform)
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
+
+    @property
+    def raw_dir(self):
+        return os.path.join(self.root, "splits_%s" % self.graph_name)
+
+    @property
+    def processed_dir(self):
+        return os.path.join(
+            self.root,
+            "processed_atlas",
+            f"{self.graph_name}-{self.graph_idx:04d}",
+            "processed",
+        )
+
+    @property
+    def processed_file_names(self):
+        return "data.pt"
+
+    def process(self):
+        nodes_csv = os.path.join(
+            self.root,
+            f"splits_{self.graph_name}",
+            f"{self.graph_name}_{self.graph_idx:04d}_nodes.csv",
+        )
+        edges_csv = os.path.join(
+            self.root,
+            f"splits_{self.graph_name}",
+            f"{self.graph_name}_{self.graph_idx:04d}_edges.csv",
+        )
+        if not os.path.exists(nodes_csv):
+            raise FileNotFoundError(f"Atlas nodes file not found: {nodes_csv}")
+        if not os.path.exists(edges_csv):
+            raise FileNotFoundError(f"Atlas edges file not found: {edges_csv}")
+
+        # 1) Load nodes and remap original node id -> [0..N-1]
+        old_id_to_name = {}
+        with open(nodes_csv, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                nid = str((row.get("id") or "")).strip()
+                if not nid:
+                    continue
+                old_id_to_name[nid] = str((row.get("name") or "")).strip()
+        old_ids = sorted(old_id_to_name.keys(), key=lambda x: int(x))
+        old_to_new = {old: new for new, old in enumerate(old_ids)}
+        id2entity = {new: old_id_to_name[old] for old, new in old_to_new.items()}
+
+        # 2) Load edges; remap src/dst ids and relation ids
+        rel2id = {}
+        triplets = []
+        with open(edges_csv, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                s_old = str((row.get("src_id") or "")).strip()
+                t_old = str((row.get("dst_id") or "")).strip()
+                if not s_old or not t_old:
+                    continue
+                if s_old not in old_to_new or t_old not in old_to_new:
+                    continue
+
+                rel = str((row.get("relation") or "Relation")).strip() or "Relation"
+                if rel not in rel2id:
+                    rel2id[rel] = len(rel2id)
+                r = rel2id[rel]
+                triplets.append((old_to_new[s_old], old_to_new[t_old], r))
+
+        if len(triplets) == 0:
+            raise RuntimeError(f"No valid triplets loaded from: {edges_csv}")
+
+        # 3) Split target edges into train/valid/test = 8:1:1
+        triplets_tensor = torch.tensor(triplets, dtype=torch.long)
+        num_edges = triplets_tensor.shape[0]
+        g = torch.Generator()
+        g.manual_seed(self.split_seed + self.graph_idx)
+        perm = torch.randperm(num_edges, generator=g)
+        triplets_tensor = triplets_tensor[perm]
+
+        n_train = int(num_edges * 0.8)
+        n_valid = int(num_edges * 0.1)
+        n_test = num_edges - n_train - n_valid
+        if n_train <= 0 or n_valid <= 0 or n_test <= 0:
+            raise RuntimeError(
+                f"Atlas split failed due to too few edges: total={num_edges}, "
+                f"train={n_train}, valid={n_valid}, test={n_test}"
+            )
+
+        train_t = triplets_tensor[:n_train]
+        valid_t = triplets_tensor[n_train:n_train + n_valid]
+        test_t = triplets_tensor[n_train + n_valid:]
+
+        num_nodes = len(old_to_new)
+        num_relations = len(rel2id)
+
+        train_target_edges = train_t[:, :2].T.contiguous()
+        train_target_types = train_t[:, 2].contiguous()
+        valid_target_edges = valid_t[:, :2].T.contiguous()
+        valid_target_types = valid_t[:, 2].contiguous()
+        test_target_edges = test_t[:, :2].T.contiguous()
+        test_target_types = test_t[:, 2].contiguous()
+
+        # Following existing pipelines: use train facts (+ inverse edges) as message graph.
+        train_edges = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
+        train_types = torch.cat([train_target_types, train_target_types + num_relations])
+
+        train_data = Data(
+            edge_index=train_edges,
+            edge_type=train_types,
+            num_nodes=num_nodes,
+            target_edge_index=train_target_edges,
+            target_edge_type=train_target_types,
+            num_relations=num_relations * 2,
+        )
+        valid_data = Data(
+            edge_index=train_edges,
+            edge_type=train_types,
+            num_nodes=num_nodes,
+            target_edge_index=valid_target_edges,
+            target_edge_type=valid_target_types,
+            num_relations=num_relations * 2,
+        )
+        test_data = Data(
+            edge_index=train_edges,
+            edge_type=train_types,
+            num_nodes=num_nodes,
+            target_edge_index=test_target_edges,
+            target_edge_type=test_target_types,
+            num_relations=num_relations * 2,
+        )
+
+        current_dataset = f"{self.dataset_name}-{self.dataset_version}"
+        train_data.dataset = current_dataset
+        valid_data.dataset = current_dataset
+        test_data.dataset = current_dataset
+
+        id2relation = {v: k for k, v in rel2id.items()}
+        train_data.id2entity = id2entity
+        valid_data.id2entity = id2entity
+        test_data.id2entity = id2entity
+        train_data.id2relation = id2relation
+        valid_data.id2relation = id2relation
+        test_data.id2relation = id2relation
+        train_data.edge2id = rel2id
+        valid_data.edge2id = rel2id
+        test_data.edge2id = rel2id
+
+        if self.pre_transform is not None:
+            train_data = self.pre_transform(train_data)
+            valid_data = self.pre_transform(valid_data)
+            test_data = self.pre_transform(test_data)
+
+        train_data.train_id2entity = train_data.id2entity
+        valid_data.train_id2entity = train_data.id2entity
+        test_data.train_id2entity = train_data.id2entity
+        valid_data.valid_id2entity = valid_data.id2entity
+        train_data.valid_id2entity = valid_data.id2entity
+        test_data.valid_id2entity = valid_data.id2entity
+        test_data.test_id2entity = test_data.id2entity
+        train_data.test_id2entity = test_data.id2entity
+        valid_data.test_id2entity = test_data.id2entity
+
+        train_data.train_id2relation = train_data.id2relation
+        valid_data.train_id2relation = train_data.id2relation
+        test_data.train_id2relation = train_data.id2relation
+        valid_data.valid_id2relation = valid_data.id2relation
+        train_data.valid_id2relation = valid_data.id2relation
+        test_data.valid_id2relation = valid_data.id2relation
+        test_data.test_id2relation = test_data.id2relation
+        train_data.test_id2relation = test_data.id2relation
+        valid_data.test_id2relation = test_data.id2relation
+
+        train_data.train_edge2id = train_data.edge2id
+        valid_data.train_edge2id = train_data.edge2id
+        test_data.train_edge2id = train_data.edge2id
+        valid_data.valid_edge2id = valid_data.edge2id
+        train_data.valid_edge2id = valid_data.edge2id
+        test_data.valid_edge2id = valid_data.edge2id
+        test_data.test_edge2id = test_data.edge2id
+        train_data.test_edge2id = test_data.edge2id
+        valid_data.test_edge2id = test_data.edge2id
+
+        attrs_to_remove = ["id2entity", "id2relation", "edge2id"]
+        for data in [train_data, valid_data, test_data]:
+            for attr in attrs_to_remove:
+                if hasattr(data, attr):
+                    delattr(data, attr)
+
+        torch.save((self.collate([train_data, valid_data, test_data])), self.processed_paths[0])
 
 # a joint dataset for pre-training ULTRA on several graphs
 class JointDataset(InMemoryDataset): 
@@ -3413,22 +3638,22 @@ class JointDataset(InMemoryDataset):
 
     datasets_map = {
     #     #共16个transductive,使用11个训练(去掉子集)
-    #     'FB15k237': FB15k237, #包含了fb15k237的子图 FB15k237_10, FB15k237_20, FB15k237_50 共4个
-    #     'WN18RR': WN18RR,
-    #     'CoDExSmall': CoDExSmall,
-    #     'CoDExMedium': CoDExMedium,
-    #     'CoDExLarge': CoDExLarge, #使用codexlarge即可
-    #     'NELL995': NELL995,
-    #     'ConceptNet100k': ConceptNet100k,
-    #     'DBpedia100k': DBpedia100k,
-    #     'YAGO310': YAGO310,
-    #     'AristoV4': AristoV4,
-    #     'Hetionet': Hetionet,
-    #     'WDsinger': WDsinger,
-    #     'NELL23k': NELL23k, 
-    #    # inductive  new nodes no new relations 18个
-    #    # FB15k237Inductiv(4个),wn18rrinductive(4个),nellinductive(4个)
-    #    'ILPC2022': ILPC2022, #small ,large 2个
+        'FB15k237': FB15k237, #包含了fb15k237的子图 FB15k237_10, FB15k237_20, FB15k237_50 共4个
+        # 'WN18RR': WN18RR,
+        'CoDExSmall': CoDExSmall,
+        'CoDExMedium': CoDExMedium,
+        'CoDExLarge': CoDExLarge, #使用codexlarge即可
+        'NELL995': NELL995,
+        'ConceptNet100k': ConceptNet100k,
+        'DBpedia100k': DBpedia100k,
+        'YAGO310': YAGO310,
+        'AristoV4': AristoV4,
+        'Hetionet': Hetionet,
+        'WDsinger': WDsinger,
+        'NELL23k': NELL23k, 
+       # inductive  new nodes no new relations 18个
+       # FB15k237Inductiv(4个),wn18rrinductive(4个),nellinductive(4个)
+       'ILPC2022': ILPC2022, #small ,large 2个
        'HM': HM, #1k,3k,5k,indigo 4个
        # inductive  new nodes new relations 共23个  (13个 fb,wn,nl )
        'WikiTopicsMT1': WikiTopicsMT1, # tax, health 2个
@@ -3437,6 +3662,7 @@ class JointDataset(InMemoryDataset):
        'WikiTopicsMT4': WikiTopicsMT4, #sci, health 2个
        'Metafam': Metafam,
        'FBNELL': FBNELL,
+       'Atlas': Atlas,
     }
 
     def __init__(self, root, graphs, transform=None, pre_transform=None):
