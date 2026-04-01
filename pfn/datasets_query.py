@@ -12,8 +12,8 @@ from functools import partial
 from torch_scatter import scatter_add
 from torch_geometric.data import Data, InMemoryDataset, download_url, extract_zip
 
-from ultra.query_utils import Query
-from ultra.tasks import build_relation_graph
+from .query_utils import Query
+from .tasks import build_relation_graph
 from ultra.base_nbfnet import index_to_mask
 
 

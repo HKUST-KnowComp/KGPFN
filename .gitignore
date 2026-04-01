@@ -164,3 +164,10 @@ output/
 .DS_Store
 kg-datasets/
 *.csv
+data/
+datasets/
+runs/
+logs/
+wandb/
+cache/
+*.tsv

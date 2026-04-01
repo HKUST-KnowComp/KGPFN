@@ -1,0 +1,28 @@
+preprocess_config_x:
+  num_features: 2
+  nan_handling_enabled: true
+  normalize_on_train_only: true
+  normalize_x: true
+  remove_outliers: false
+  normalize_by_used_features: true
+encoder_config_x:
+  num_features: 2
+  embedding_size: 192
+  mask_embedding_size: 192
+  encoder_use_bias: true
+encoder_config_y:
+  num_inputs: 1
+  embedding_size: 192
+  nan_handling_y_encoder: true
+  max_num_classes: 10
+decoder_config:
+  num_classes: 10
+nlayers: 12
+nhead: 6
+embed_dim: 192
+hid_dim: 768
+features_per_group: 2
+dropout: 0.0
+recompute_attn: false
+mask_prediction: false
+num_thinking_rows: 0 #0

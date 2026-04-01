@@ -5,6 +5,7 @@ import copy
 import time
 import logging
 import argparse
+import shutil
 
 import yaml
 import jinja2
@@ -16,7 +17,7 @@ from torch import distributed as dist
 from torch_geometric.data import Data
 from torch_geometric.datasets import RelLinkPredDataset, WordNet18RR
 
-from ultra import models, datasets
+from . import datasets
 
 
 logger = logging.getLogger(__file__)
@@ -51,7 +52,7 @@ def literal_eval(string):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="yaml configuration file", required=True)
-    parser.add_argument("-s", "--seed", help="random seed for PyTorch", type=int, default=1024)
+    parser.add_argument("-s", "--seed", help="random seed for PyTorch", type=int, default=0)
 
     args, unparsed = parser.parse_known_args()
     # get dynamic arguments defined in the config file
@@ -110,7 +111,11 @@ def get_device(cfg):
     return device
 
 
-def create_working_directory(cfg):
+def create_working_directory(cfg, chdir=True):
+    """
+    创建并返回 working_dir。chdir=True 时切换当前目录到 working_dir（兼容旧行为）；
+    chdir=False 时保持 cwd 不变，便于 dataset.root 等相对路径始终基于项目根目录解析。
+    """
     file_name = "working_dir.tmp"
     world_size = get_world_size()
     if cfg.train.gpus is not None and len(cfg.train.gpus) != world_size:
@@ -121,8 +126,8 @@ def create_working_directory(cfg):
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl", init_method="env://")
 
-    working_dir = os.path.join(os.path.expanduser(cfg.output_dir),
-                               cfg.model["class"], cfg.dataset["class"], time.strftime("%Y-%m-%d-%H-%M-%S"))
+    working_dir = os.path.abspath(os.path.join(os.path.expanduser(cfg.output_dir),
+                               cfg.model["class"], cfg.dataset["class"], time.strftime("%Y-%m-%d-%H-%M-%S")))
 
     # synchronize working directory
     if get_rank() == 0:
@@ -137,16 +142,41 @@ def create_working_directory(cfg):
     if get_rank() == 0:
         os.remove(file_name)
 
-    os.chdir(working_dir)
+    if chdir:
+        os.chdir(working_dir)
     return working_dir
 
 
 def build_dataset(cfg):
     data_config = copy.deepcopy(cfg.dataset)
     cls = data_config.pop("class")
+    version = data_config.pop("version", None)
 
-    ds_cls = getattr(datasets, cls)
-    dataset = ds_cls(**data_config)
+    # 解析 dataset.root 相对项目根目录（chdir 后相对路径会错误解析到 working_dir）
+    if "root" in data_config and data_config["root"] and not os.path.isabs(data_config["root"]):
+        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_config["root"] = os.path.abspath(os.path.join(_project_root, data_config["root"]))
+
+    if(cls == "JointDataset"):
+        ds_cls = getattr(datasets, cls)
+        dataset = ds_cls(**data_config)
+    else:
+        ds_cls = getattr(datasets, cls)
+        dataset = ds_cls(**data_config, dataset_name=cls, dataset_version=version)
+
+    # Rebuild stale processed cache once if name maps are missing.
+    # This typically happens when old processed files were generated before
+    # train_id2entity / train_id2relation were added.
+    if cls != "JointDataset":
+        train_data = dataset[0]
+        has_e = bool(getattr(train_data, "train_id2entity", {}))
+        has_r = bool(getattr(train_data, "train_id2relation", {}))
+        if not (has_e and has_r):
+            processed_dir = getattr(dataset, "processed_dir", None)
+            if processed_dir and os.path.isdir(processed_dir):
+                logger.warning("Name maps missing in processed cache, rebuilding: %s", processed_dir)
+                shutil.rmtree(processed_dir, ignore_errors=True)
+                dataset = ds_cls(**data_config, dataset_name=cls, dataset_version=version)
 
     if get_rank() == 0:
         logger.warning("%s dataset" % (cls if "version" not in cfg.dataset else f'{cls}({cfg.dataset.version})'))

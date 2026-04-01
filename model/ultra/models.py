@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 
-from . import tasks, layers
+from pfn import tasks
+from . import layers
 from ultra.base_nbfnet import BaseNBFNet
 
 class Ultra(nn.Module):

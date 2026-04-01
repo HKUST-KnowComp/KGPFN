@@ -11,13 +11,11 @@ import yaml
 from itertools import islice
 from functools import partial
 from typing import Any
-from tqdm import tqdm
 
 import torch
 from torch import optim
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.parameter import UninitializedParameter
 from torch import distributed as dist
 from torch.utils import data as torch_data
 from torch_geometric.data import Data
@@ -25,7 +23,7 @@ from torch_geometric.data import Data
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from pfn import tasks, util
 from model.ultra.encoder import StructureEncoderRelationAware
-from model.kgpfnsem import KGPFN, LabelSmoothingLoss
+from model.kgpfnsem import KGPFN
 from huggingface_hub import hf_hub_download
 from utils.loading import build_custom_model, load_state_dict_matching
 import wandb
@@ -118,6 +116,15 @@ def _get_project_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _resolve_path(path: str | None, project_root: str) -> str | None:
+    """相对路径转为相对于 project_root 的绝对路径；绝对路径或空则原样返回"""
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(project_root, path))
+
+
 def _get_limix_config_path(cfg):
     # 允许从配置覆盖 limix config 路径；默认沿用当前脚本内的本地配置文件
     default_dir = os.path.join(_get_project_root(), "config", "limix")
@@ -183,8 +190,6 @@ def wandb_init(cfg, logger):
             "adversarial_temperature": adv_temp,
             "num_thinking_rows": num_thinking_rows,
             "train_structure_encoder": bool(cfg.train.get("train_structure_encoder", True)),
-            "loss_type": str(cfg.task.get("loss_type", "bce")),
-            "label_smoothing": float(cfg.task.get("label_smoothing", 0.0)),
         },
     )
     logger.warning("wandb initialized: project=%s, run=%s", run.project, run.name)
@@ -242,7 +247,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
             state = torch.load(structure_encoder_path, map_location=map_location)
             sd = state["model"] if isinstance(state, dict) and "model" in state else state
             model.structure_encoder.load_state_dict(sd, strict=False)
-            print("Initialized structure encoder successfully")
+
         # 2) 初始化 feature transformer
         limix_repo_id = cfg.train.get("limix_repo_id", "stableai-org/LimiX-16M")
         limix_filename = cfg.train.get("limix_filename", "LimiX-16M.ckpt")
@@ -283,38 +288,28 @@ def multigraph_collator(batch, train_graphs):
     batch = torch.cat([graph.target_edge_index[:, edge_mask], graph.target_edge_type[edge_mask].unsqueeze(0)]).t()
     return graph, batch
 
+# here we assume that train_data and valid_data are tuples of datasets
+def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, batch_per_epoch=None):
 
-# 单图数据集训练
-def train_and_validate(cfg, model, train_data, valid_data, device, logger, filtered_data=None, batch_per_epoch=None):
-    import copy
-    valid_data_full = copy.copy(valid_data)
-    valid_data_full.edge_index = filtered_data.edge_index
-    valid_data_full.edge_type = filtered_data.edge_type
     if cfg.train.num_epoch == 0:
         return
 
     world_size = util.get_world_size()
     rank = util.get_rank()
 
-    # 单图数据集：直接使用 train_data.target_edge_index
-    train_triplets = torch.cat([train_data.target_edge_index, train_data.target_edge_type.unsqueeze(0)]).t()
+    train_triplets = torch.cat([
+        torch.cat([g.target_edge_index, g.target_edge_type.unsqueeze(0)]).t()
+        for g in train_data
+    ])
     sampler = torch_data.DistributedSampler(train_triplets, world_size, rank)
-    train_loader = torch_data.DataLoader(train_triplets, cfg.train.batch_size, sampler=sampler)
+    train_loader = torch_data.DataLoader(train_triplets, cfg.train.batch_size, sampler=sampler, collate_fn=partial(multigraph_collator, train_graphs=train_data))
 
-    # 确保 batch_per_epoch 有效：处理 YAML 中的 "None"/"null" 字符串
-    train_loader_len = len(train_loader)
-    if batch_per_epoch is None or batch_per_epoch == "None" or batch_per_epoch == "null":
-        batch_per_epoch = None  # islice 接受 None 表示遍历全部
-    elif not isinstance(batch_per_epoch, int) or batch_per_epoch <= 0:
-        batch_per_epoch = train_loader_len
-    else:
-        batch_per_epoch = min(batch_per_epoch, train_loader_len)
+    batch_per_epoch = batch_per_epoch or len(train_loader)
 
     cls = cfg.optimizer.pop("class")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = getattr(optim, cls)(trainable_params, **cfg.optimizer)
-    # Lazy modules（如 LazyLinear）在首个 forward 前参数可能未初始化，统计时需跳过
-    num_params = sum(p.numel() for p in model.parameters() if not isinstance(p, UninitializedParameter))
+    num_params = sum(p.numel() for p in model.parameters())
     logger.warning(line)
     logger.warning(f"Number of parameters: {num_params}")
 
@@ -322,8 +317,6 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
         parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device])
     else:
         parallel_model = model
-    
-    use_text_input = _semantic_enabled(parallel_model)
 
     step = math.ceil(cfg.train.num_epoch / 10)
 
@@ -334,13 +327,6 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
     use_wandb = bool(cfg.train.get("use_wandb", False))
     valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
     best_mrr = -1.0  # 用于保存 MRR 最优的 checkpoint
-
-    loss_type = str(cfg.task.get("loss_type", "bce")).strip().lower()
-    label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
-    if loss_type == "softmax":
-        softmax_loss_fn = LabelSmoothingLoss(smoothing=label_smoothing, reduction="mean")
-    if util.get_rank() == 0:
-        logger.warning(f"Loss type: {loss_type}" + (f", label_smoothing: {label_smoothing}" if loss_type == "softmax" else ""))
 
     batch_id = 0
     for i in range(0, cfg.train.num_epoch, step):
@@ -353,9 +339,12 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
             losses = []
             sampler.set_epoch(epoch)
             for batch in islice(train_loader, batch_per_epoch):
+                # now at each step we sample a new graph and edges from it
+                train_graph, batch = batch
+
                 # 1) 负采样得到 (B, N, 3) 的 query 三元组
-                batch_neg = tasks.negative_sampling_tail(
-                    train_data,
+                batch_with_neg = tasks.negative_sampling_tail(
+                    train_graph,
                     batch,
                     cfg.task.num_negative,
                     strict=cfg.task.strict_negative,
@@ -363,76 +352,60 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                
                 # 2) 为每条 query 构造上下文三元组
                 context_triples, context_labels = tasks.build_context_relation_aware(
-                    train_data,
-                    batch_neg,
+                    train_graph,
+                    batch_with_neg,
                     num_pos=cfg.task.num_pos,
                     num_neg=cfg.task.num_neg,
                 )
 
                 # 3) 组织成 KGPFN / PFN 所需的输入格式（可选 text）
-                query_ids = batch_neg.to(device)  # (B, S_q, 3)
+                query_ids = batch_with_neg.to(device)  # (B, S_q, 3)
                 context_ids = [t.to(device) for t in context_triples]
                 context_y = [t.to(device) for t in context_labels]
-                query_x, context_x = _build_model_inputs(
-                    query_ids, 
-                    context_ids, 
-                    train_data, 
-                    enable_text=use_text_input,
-                )
+                use_text_input = _semantic_enabled(parallel_model)
+                query_x, context_x = _build_model_inputs(query_ids, context_ids, train_graph, enable_text=use_text_input)
 
                 # 4) 前向：这里用回归头（或按需改成 "cls"）
                 pred = parallel_model(
-                    train_data,
+                    train_graph,
                     query_x=query_x,
                     context_x=context_x,
                     context_y=context_y,
                     task_type="reg",
                 )
 
-                # 5) 目标：正样本在 col 0，负样本在 col 1:
-                if loss_type != "softmax":
-                    pos_loss = F.binary_cross_entropy_with_logits(pred[:, 0], torch.ones(pred.size(0), device=device))
-                    neg_loss = F.binary_cross_entropy_with_logits(pred[:, 1:].reshape(-1), torch.zeros(pred[:, 1:].numel(), device=device))
-
-                if loss_type == "softmax":
-                    # softmax + NLL（可选 label smoothing）：对每个 batch 样本在 l 个候选上做归一化
-                    sm_target = torch.zeros(pred.size(0), dtype=torch.long, device=device)  # 正样本始终在 col 0
-                    loss = softmax_loss_fn(pred, sm_target)
+                # 5) 目标：正样本在 col 0，负样本在 col 1:；loss 加权方式与 pretrain.py 一致
+                target = torch.zeros_like(pred)
+                if target.numel() > 0:
+                    target[:, 0] = 1.0
+                loss_raw = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+                neg_weight = torch.ones_like(pred)
+                if adversarial_temperature > 0:
+                    with torch.no_grad():
+                        neg_weight[:, 1:] = F.softmax(
+                            pred[:, 1:] / adversarial_temperature, dim=-1
+                        )
                 else:
-                    # bce（默认）：带 adversarial 加权的 binary cross entropy
-                    bce_target = torch.zeros_like(pred)
-                    bce_target[:, 0] = 1.0
-                    loss_raw = F.binary_cross_entropy_with_logits(pred, bce_target, reduction="none")
-                    neg_weight = torch.ones_like(pred)
-                    if adversarial_temperature > 0:
-                        with torch.no_grad():
-                            neg_weight[:, 1:] = F.softmax(
-                                pred[:, 1:] / adversarial_temperature, dim=-1
-                            )
-                    else:
-                        neg_weight[:, 1:] = 1 / cfg.task.num_negative
-                    loss = (loss_raw * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
-                    loss = loss.mean()
+                    neg_weight[:, 1:] = 1 / cfg.task.num_negative
+                loss = (loss_raw * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
+                loss = loss.mean()
 
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
-                if util.get_rank() == 0 and batch_id % cfg.train.log_interval == 0:
+                if batch_id % cfg.train.log_interval == 0:
                     logger.warning(separator)
                     logger.warning("binary cross entropy: %g" % loss.item())
-                    if loss_type != "softmax":
-                        logger.warning("  - pos loss: %g, neg loss: %g" % (pos_loss.item(), neg_loss.item()))
-                    if use_wandb and wandb is not None:
-                        wandb_payload = {
-                            "train/loss_step": loss.item(),
-                            "train/epoch": epoch,
-                            "train/step": batch_id,
-                        }
-                        if loss_type != "softmax":
-                            wandb_payload["train/pos_loss"] = pos_loss.item()
-                            wandb_payload["train/neg_loss"] = neg_loss.item()
-                        wandb.log(wandb_payload, step=batch_id)
+                    if use_wandb and util.get_rank() == 0 and wandb is not None:
+                        wandb.log(
+                            {
+                                "train/loss_step": loss.item(),
+                                "train/epoch": epoch,
+                                "train/step": batch_id,
+                            },
+                            step=batch_id,
+                        )
                 losses.append(loss.item())
                 batch_id += 1
 
@@ -441,9 +414,7 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                     if util.get_rank() == 0:
                         logger.warning(separator)
                         logger.warning("Evaluate on valid at step %d", batch_id)
-                    valid_mrr = test(cfg, model, valid_data, device=device, logger=logger, filtered_data=filtered_data, split="valid")
-                    # 创建临时副本用于非 transductive 评测（全图）
-                    
+                    valid_mrr = test(cfg, model, valid_data, filtered_data=filtered_data, split="valid")
                     if util.get_rank() == 0:
                         logger.warning("valid mrr: %g", valid_mrr)
                         if use_wandb and wandb is not None:
@@ -451,7 +422,6 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                                 {
                                     "valid/mrr": float(valid_mrr),
                                     "train/epoch": epoch,
-
                                 },
                                 step=batch_id,
                             )
@@ -494,6 +464,7 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                 wandb.log(
                     {
                         "train/loss_epoch": avg_loss,
+                        "train/metric": avg_loss,  # 先以 epoch loss 作为主要监控 metric
                         "train/epoch": epoch,
                     },
                     step=batch_id,
@@ -503,266 +474,202 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
 
 
 @torch.no_grad()
-def test(cfg, model, test_data, device, logger, filtered_data=None, return_metrics=False, split: str = "test"):
-    """
-    单图数据集评测函数（tail-only）：
-    1. 只评测 tail
-    2. 统一构建上下文，得到 embedding_cache
-    3. 根据 chunk 不断计算分数
-    4. 同时计算正负样本 BCE loss（用于诊断）
-    """
+def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
     world_size = util.get_world_size()
     rank = util.get_rank()
-    
-    model.eval()
-    
-    test_triplets = torch.cat([test_data.target_edge_index, test_data.target_edge_type.unsqueeze(0)]).t()
-    sampler = torch_data.DistributedSampler(test_triplets, world_size, rank)
-    test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
-
-    loss_type = str(cfg.task.get("loss_type", "bce")).strip().lower()
-
-    rankings = []
-    num_negatives = []
-    if loss_type != "softmax":
-        total_pos_loss = 0.0
-        total_neg_loss = 0.0
-        total_pos_count = 0
-        total_neg_count = 0
-
-    use_text_input = _semantic_enabled(model)
     eval_chunk_size = int(cfg.train.get("eval_chunk_size", 64))
+    eval_log_interval = int(cfg.train.get("eval_log_interval", 50))
+    score_threshold = float(cfg.train.get("eval_score_threshold", 0.5))
     
-    # 只在主进程显示 tqdm
-    test_iterator = tqdm(test_loader, desc="Evaluating", disable=rank != 0)
-    
-    for batch in test_iterator:
-        
-        # 1) 严格负采样评测：tail 全候选
-        t_batch, _ = tasks.all_negative(test_data, batch)  # (B, num_nodes, 3)
-        B, num_nodes, _ = t_batch.shape
-        
-        if filtered_data is None:
-            t_mask, _ = tasks.strict_negative_mask(test_data, batch)
-        else:
-            t_mask, _ = tasks.strict_negative_mask(filtered_data, batch)
-        pos_h_index, pos_t_index, pos_r_index = batch.t()
+    # test_data is a tuple of validation/test datasets
+    # process sequentially
+    all_metrics = []
+    collected_metric_values: dict[str, list[float]] = {}
+    for test_graph, filters in zip(test_data, filtered_data):
 
-        # 2) 批量构建所有上下文（统一为当前 batch 构建）
-        ctx_triples, ctx_labels = tasks.build_context_relation_aware(
-            test_data, 
-            batch.unsqueeze(1).to(device),  # [B, 1, 3]
-            num_pos=cfg.task.num_pos, 
-            num_neg=cfg.task.num_neg
-        )
-        # test_data.edge_index = filtered_data.edge_index
-        # test_data.edge_type = filtered_data.edge_type
-        # 3) 预计算上下文 embedding cache [B, M, *, D]，同时获取（可能修正的）标签
-        context_cache, ctx_labels = model.get_context_embeddings_cache(
-            test_data, ctx_triples, ctx_labels
-        )
-        
-        # 4) 分 chunk 批量评测所有 tail 候选
-        batch_scores = torch.zeros(B, num_nodes, device=device)
-        
-        for start in range(0, num_nodes, max(1, eval_chunk_size)):
-            end = min(start + eval_chunk_size, num_nodes)
-            
-            # 构建该 chunk 的 tail 候选: [B, chunk, 3]
-            t_ids_chunk = t_batch[:, start:end, :]  # [B, chunk, 3]
-            
-            # 使用 get_scores 计算分数
-            chunk_scores = model.get_scores(
-                test_data,
-                query_x=t_ids_chunk,
-                context_cache=context_cache,
-                context_y=ctx_labels,
-                task_type="reg",
-            )  # [B, chunk]
-            
-            batch_scores[:, start:end] = chunk_scores
-        
-        # 5) 计算 BCE loss（用于诊断）— 仅在 bce 模式下
-        if loss_type != "softmax":
-            pos_scores = batch_scores[torch.arange(B, device=device), pos_t_index]  # [B]
-            pos_loss_sum = F.binary_cross_entropy_with_logits(pos_scores, torch.ones_like(pos_scores), reduction='sum')
-            neg_mask = (t_mask == 0)
-            if neg_mask.any():
-                neg_scores_all = batch_scores[neg_mask]  # [num_neg]
-                neg_loss_sum = F.binary_cross_entropy_with_logits(neg_scores_all, torch.zeros_like(neg_scores_all), reduction='sum')
-                num_neg_samples = neg_mask.sum().item()
+        test_triplets = torch.cat([test_graph.target_edge_index, test_graph.target_edge_type.unsqueeze(0)]).t()
+        sampler = torch_data.DistributedSampler(test_triplets, world_size, rank)
+        test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
+
+        model.eval()
+        rankings = []
+        num_negatives = []
+        # classification-style metrics（基于 logit 阈值）
+        tp_total = torch.zeros(1, dtype=torch.float32, device=device)
+        fp_total = torch.zeros(1, dtype=torch.float32, device=device)
+        fn_total = torch.zeros(1, dtype=torch.float32, device=device)
+        for batch in test_loader:
+            # 1) 严格负采样评测：tail 全候选
+            t_batch, _ = tasks.all_negative(test_graph, batch)  # (B, num_nodes, 3)
+            B, num_nodes, _ = t_batch.shape
+
+            if filtered_data is None:
+                t_mask, h_mask = tasks.strict_negative_mask(test_graph, batch)
             else:
-                neg_loss_sum = torch.tensor(0.0, device=device)
-                num_neg_samples = 0
-            total_pos_loss += pos_loss_sum.item()
-            total_neg_loss += neg_loss_sum.item()
-            total_pos_count += B
-            total_neg_count += num_neg_samples
+                t_mask, h_mask = tasks.strict_negative_mask(filters, batch)
+            pos_h_index, pos_t_index, pos_r_index = batch.t()
 
-        # 6) ranking
-        t_ranking = tasks.compute_ranking(batch_scores, pos_t_index, t_mask)
-        num_t_negative = t_mask.sum(dim=-1)
+            # 2) 对每个 batch 行只构建一次上下文，在多个 chunk 间复用
+            # build_context_for_batch 期望 [B, N, 3]，这里用 N=1 的锚点 query
+            row_anchor_batch = batch.unsqueeze(1)
+            shared_context_x, shared_context_y = tasks.build_context_relation_aware(
+                test_graph,
+                row_anchor_batch,
+                num_pos=cfg.task.num_pos,
+                num_neg=cfg.task.num_neg,
+            )  # 长度为 B
+            shared_context_x = [t.to(device) for t in shared_context_x]
+            shared_context_y = [y.to(device) for y in shared_context_y]
 
-        rankings += [t_ranking]
-        num_negatives += [num_t_negative]
+            # 3) 预计算上下文 embedding cache，同时获取（可能修正的）标签
+            context_cache, shared_context_y = model.get_context_embeddings_cache(
+                test_graph, shared_context_x, shared_context_y
+            )
 
-    ranking = torch.cat(rankings)
-    num_negative = torch.cat(num_negatives)
-    
-    if loss_type != "softmax":
-        avg_pos_loss = total_pos_loss / total_pos_count if total_pos_count > 0 else 0.0
-        avg_neg_loss = total_neg_loss / total_neg_count if total_neg_count > 0 else 0.0
+            # 4) 分 chunk 评测所有 tail 候选
+            t_score_chunks = []
+            for start in range(0, num_nodes, max(1, eval_chunk_size)):
+                end = min(start + max(1, eval_chunk_size), num_nodes)
+                t_batch_chunk = t_batch[:, start:end, :]  # (B, chunk, 3)
+                t_scores_chunk = model.get_scores(
+                    test_graph,
+                    query_x=t_batch_chunk.to(device),
+                    context_cache=context_cache,
+                    context_y=shared_context_y,
+                    task_type="reg",
+                )
+                t_score_chunks.append(t_scores_chunk.view(B, -1))
+            t_pred = torch.cat(t_score_chunks, dim=1)  # (B, num_nodes)
 
-    all_size = torch.zeros(world_size, dtype=torch.long, device=device)
-    all_size[rank] = len(ranking)
-    if world_size > 1:
-        dist.all_reduce(all_size, op=dist.ReduceOp.SUM)
-    cum_size = all_size.cumsum(0)
-    all_ranking = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-    all_ranking[cum_size[rank] - all_size[rank]: cum_size[rank]] = ranking
-    all_num_negative = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-    all_num_negative[cum_size[rank] - all_size[rank]: cum_size[rank]] = num_negative
-    if world_size > 1:
-        dist.all_reduce(all_ranking, op=dist.ReduceOp.SUM)
-        dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
+            # 4) ranking（这里按 tail-only 汇总，契合当前 (h,r,?) 设定）
+            t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
+            num_t_negative = t_mask.sum(dim=-1)
 
-    mrr = (1 / all_ranking.float()).mean()
-    
-    if rank == 0:
-        logger.warning(separator)
-        for metric in cfg.task.metric:
-            if metric == "mr":
-                score = all_ranking.float().mean()
-            elif metric == "mrr":
-                score = (1 / all_ranking.float()).mean()
-            elif metric.startswith("hits@"):
-                threshold = int(metric[5:])
-                score = (all_ranking <= threshold).float().mean()
-            else:
-                continue
-            logger.warning("%s: %g" % (metric, score))
-        if loss_type != "softmax":
-            logger.warning("pos loss: %g, neg loss: %g" % (avg_pos_loss, avg_neg_loss))
-        logger.warning(separator)
+            rankings += [t_ranking]
+            num_negatives += [num_t_negative]
 
-    if return_metrics:
-        metrics = {"mrr": mrr}
-        if loss_type != "softmax":
-            metrics["pos_loss"] = avg_pos_loss
-            metrics["neg_loss"] = avg_neg_loss
-        return metrics
-    return mrr
+            # 5) 计算 precision/recall/f1（只在 filtered 可比较集合内）
+            valid_mask = t_mask.clone()
+            valid_mask.scatter_(1, pos_t_index.unsqueeze(-1), True)  # 把正例位加入评估
+            pred_pos = t_pred > score_threshold
+            gt_pos = torch.zeros_like(pred_pos, dtype=torch.bool)
+            gt_pos.scatter_(1, pos_t_index.unsqueeze(-1), True)
+            pred_pos = pred_pos & valid_mask
+            gt_pos = gt_pos & valid_mask
 
-@torch.no_grad()
-def test_encoder(cfg, model, test_data, device, logger, filtered_data=None, return_metrics=False):
-    world_size = util.get_world_size()
-    rank = util.get_rank()
+            tp = (pred_pos & gt_pos).sum().float()
+            fp = (pred_pos & ~gt_pos).sum().float()
+            fn = ((~pred_pos) & gt_pos).sum().float()
+            tp_total += tp
+            fp_total += fp
+            fn_total += fn
 
-    test_triplets = torch.cat([test_data.target_edge_index, test_data.target_edge_type.unsqueeze(0)]).t()
-    sampler = torch_data.DistributedSampler(test_triplets, world_size, rank)
-    test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
+            # 6) 周期性进度日志（防止验证过慢无反馈）
+            if rank == 0 and (len(rankings) % max(1, eval_log_interval) == 0):
+                cur_ranking = torch.cat(rankings)
+                cur_mrr = (1.0 / cur_ranking.float()).mean()
+                cur_hits1 = (cur_ranking <= 1).float().mean()
+                cur_hits3 = (cur_ranking <= 3).float().mean()
+                cur_hits10 = (cur_ranking <= 10).float().mean()
+                cur_hits30 = (cur_ranking <= 30).float().mean()
+                cur_precision = tp_total / (tp_total + fp_total + 1e-12)
+                cur_recall = tp_total / (tp_total + fn_total + 1e-12)
+                cur_f1 = 2 * cur_precision * cur_recall / (cur_precision + cur_recall + 1e-12)
+                logger.warning(
+                    "[eval-progress] steps=%d mrr=%.6f hits@1=%.6f hits@3=%.6f hits@10=%.6f hits@30=%.6f precision=%.6f recall=%.6f f1=%.6f",
+                    len(rankings),
+                    cur_mrr.item(),
+                    cur_hits1.item(),
+                    cur_hits3.item(),
+                    cur_hits10.item(),
+                    cur_hits30.item(),
+                    cur_precision.item(),
+                    cur_recall.item(),
+                    cur_f1.item(),
+                )
 
-    model.eval()
-    rankings = []
-    num_negatives = []
-    tail_rankings, num_tail_negs = [], []  # for explicit tail-only evaluation needed for 5 datasets
-    for batch in test_loader:
-        t_batch, h_batch = tasks.all_negative(test_data, batch)
-        t_pred = model.structure_encoder.get_score(test_data, t_batch)
-        h_pred = model.structure_encoder.get_score(test_data, h_batch)
-      
-        if filtered_data is None:
-            t_mask, h_mask = tasks.strict_negative_mask(test_data, batch)
-        else:
-            t_mask, h_mask = tasks.strict_negative_mask(filtered_data, batch)
-        pos_h_index, pos_t_index, pos_r_index = batch.t()
-        t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
-        h_ranking = tasks.compute_ranking(h_pred, pos_h_index, h_mask)
-        num_t_negative = t_mask.sum(dim=-1)
-        num_h_negative = h_mask.sum(dim=-1)
+        ranking = torch.cat(rankings)
+        num_negative = torch.cat(num_negatives)
+        all_size = torch.zeros(world_size, dtype=torch.long, device=device)
+        all_size[rank] = len(ranking)
+        if world_size > 1:
+            dist.all_reduce(all_size, op=dist.ReduceOp.SUM)
+        cum_size = all_size.cumsum(0)
+        all_ranking = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
+        all_ranking[cum_size[rank] - all_size[rank]: cum_size[rank]] = ranking
+        all_num_negative = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
+        all_num_negative[cum_size[rank] - all_size[rank]: cum_size[rank]] = num_negative
+        if world_size > 1:
+            dist.all_reduce(all_ranking, op=dist.ReduceOp.SUM)
+            dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tp_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(fp_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(fn_total, op=dist.ReduceOp.SUM)
 
-        rankings += [t_ranking, h_ranking]
-        num_negatives += [num_t_negative, num_h_negative]
-
-        tail_rankings += [t_ranking]
-        num_tail_negs += [num_t_negative]
-
-    ranking = torch.cat(rankings)
-    num_negative = torch.cat(num_negatives)
-    all_size = torch.zeros(world_size, dtype=torch.long, device=device)
-    all_size[rank] = len(ranking)
-
-    # ugly repetitive code for tail-only ranks processing
-    tail_ranking = torch.cat(tail_rankings)
-    num_tail_neg = torch.cat(num_tail_negs)
-    all_size_t = torch.zeros(world_size, dtype=torch.long, device=device)
-    all_size_t[rank] = len(tail_ranking)
-    if world_size > 1:
-        dist.all_reduce(all_size, op=dist.ReduceOp.SUM)
-        dist.all_reduce(all_size_t, op=dist.ReduceOp.SUM)
-
-    # obtaining all ranks 
-    cum_size = all_size.cumsum(0)
-    all_ranking = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-    all_ranking[cum_size[rank] - all_size[rank]: cum_size[rank]] = ranking
-    all_num_negative = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-    all_num_negative[cum_size[rank] - all_size[rank]: cum_size[rank]] = num_negative
-
-    # the same for tails-only ranks
-    cum_size_t = all_size_t.cumsum(0)
-    all_ranking_t = torch.zeros(all_size_t.sum(), dtype=torch.long, device=device)
-    all_ranking_t[cum_size_t[rank] - all_size_t[rank]: cum_size_t[rank]] = tail_ranking
-    all_num_negative_t = torch.zeros(all_size_t.sum(), dtype=torch.long, device=device)
-    all_num_negative_t[cum_size_t[rank] - all_size_t[rank]: cum_size_t[rank]] = num_tail_neg
-    if world_size > 1:
-        dist.all_reduce(all_ranking, op=dist.ReduceOp.SUM)
-        dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
-        dist.all_reduce(all_ranking_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(all_num_negative_t, op=dist.ReduceOp.SUM)
-
-    metrics = {}
-    if rank == 0:
-        for metric in cfg.task.metric:
-            if "-tail" in metric:
-                _metric_name, direction = metric.split("-")
-                if direction != "tail":
-                    raise ValueError("Only tail metric is supported in this mode")
-                _ranking = all_ranking_t
-                _num_neg = all_num_negative_t
-            else:
-                _ranking = all_ranking 
-                _num_neg = all_num_negative 
-                _metric_name = metric
-            
-            if _metric_name == "mr":
-                score = _ranking.float().mean()
-            elif _metric_name == "mrr":
-                score = (1 / _ranking.float()).mean()
-            elif _metric_name.startswith("hits@"):
-                values = _metric_name[5:].split("_")
-                threshold = int(values[0])
-                if len(values) > 1:
-                    num_sample = int(values[1])
-                    # unbiased estimation
-                    fp_rate = (_ranking - 1).float() / _num_neg
-                    score = 0
-                    for i in range(threshold):
-                        # choose i false positive from num_sample - 1 negatives
-                        num_comb = math.factorial(num_sample - 1) / \
-                                   math.factorial(i) / math.factorial(num_sample - i - 1)
-                        score += num_comb * (fp_rate ** i) * ((1 - fp_rate) ** (num_sample - i - 1))
-                    score = score.mean()
+        graph_metrics: dict[str, float] = {}
+        if rank == 0:
+            precision = tp_total / (tp_total + fp_total + 1e-12)
+            recall = tp_total / (tp_total + fn_total + 1e-12)
+            f1 = 2 * precision * recall / (precision + recall + 1e-12)
+            for metric in cfg.task.metric:
+                if metric == "mr":
+                    score = all_ranking.float().mean()
+                elif metric == "mrr":
+                    score = (1 / all_ranking.float()).mean()
+                elif metric == "precision":
+                    score = precision
+                elif metric == "recall":
+                    score = recall
+                elif metric == "f1":
+                    score = f1
+                elif metric.startswith("hits@"):
+                    values = metric[5:].split("_")
+                    threshold = int(values[0])
+                    if len(values) > 1:
+                        num_sample = int(values[1])
+                        # unbiased estimation
+                        fp_rate = (all_ranking - 1).float() / all_num_negative
+                        score = 0
+                        for i in range(threshold):
+                            # choose i false positive from num_sample - 1 negatives
+                            num_comb = math.factorial(num_sample - 1) / \
+                                    math.factorial(i) / math.factorial(num_sample - i - 1)
+                            score += num_comb * (fp_rate ** i) * ((1 - fp_rate) ** (num_sample - i - 1))
+                        score = score.mean()
+                    else:
+                        score = (all_ranking <= threshold).float().mean()
                 else:
-                    score = (_ranking <= threshold).float().mean()
-            logger.warning("%s: %g" % (metric, score))
-            metrics[metric] = score
-    mrr = (1 / all_ranking.float()).mean()
+                    raise ValueError(f"Unknown metric: {metric}")
+                logger.warning("%s: %g" % (metric, score))
+                graph_metrics[metric] = float(score.item())
+        mrr = (1 / all_ranking.float()).mean()
 
-    return mrr if not return_metrics else metrics
+        all_metrics.append(mrr)
+        if rank == 0:
+            graph_metrics["mrr"] = float(mrr.item())
+            for k, v in graph_metrics.items():
+                collected_metric_values.setdefault(k, []).append(v)
+        if rank == 0:
+            logger.warning(separator)
+
+    avg_metric = sum(all_metrics) / len(all_metrics)
+    if rank == 0 and wandb is not None and wandb.run is not None and collected_metric_values:
+        # 记录每次完整评测后的平均指标到 summary
+        for metric_name, values in collected_metric_values.items():
+            wandb.run.summary[f"{split}/{metric_name}_avg"] = float(sum(values) / len(values))
+        wandb.run.summary[f"{split}/mrr_return"] = float(avg_metric.item())
+    return avg_metric
+
 
 if __name__ == "__main__":
     args, vars = util.parse_args()
     cfg = util.load_config(args.config, context=vars)
+    # 在 chdir 前将相对路径解析为相对于项目根目录的绝对路径
+    project_root = _get_project_root()
+    for key in ("structure_encoder_path", "limix_cache_dir", "limix_config_path", "kgpfn_checkpoint"):
+        val = cfg.train.get(key)
+        if val:
+            cfg.train[key] = _resolve_path(val, project_root)
     working_dir = util.create_working_directory(cfg, chdir=False)
 
     if util.get_rank() == 0:
@@ -774,7 +681,7 @@ if __name__ == "__main__":
     # 必须用 abspath，否则 chdir(working_dir) 后相对路径会重复解析
     logger = util.get_root_logger(file=False)
     if util.get_rank() == 0:
-        log_file = getattr(cfg.train, "log_file", "logging.log")
+        log_file = getattr(cfg.train, "log_file", "pretrain_pfn.log")
         if not os.path.isabs(log_file):
             log_file = os.path.join(working_dir, log_file)
         # 使用 mode="w" 每次运行覆盖旧日志
@@ -796,22 +703,24 @@ if __name__ == "__main__":
     dataset = util.build_dataset(cfg)
     device = util.get_device(cfg)
     
-    # 单图数据集：直接使用 dataset[0], dataset[1], dataset[2]
-    train_data, valid_data, test_data = dataset[0], dataset[1], dataset[2]
+    train_data, valid_data, test_data = dataset._data[0], dataset._data[1], dataset._data[2]
     
     if "fast_test" in cfg.train:
         num_val_edges = cfg.train.fast_test
         if util.get_rank() == 0:
             logger.warning(f"Fast evaluation on {num_val_edges} samples in validation")
-        short_valid = copy.deepcopy(test_data)
-        mask = torch.randperm(short_valid.target_edge_index.shape[1])[:num_val_edges]
-        short_valid.target_edge_index = short_valid.target_edge_index[:, mask]
-        short_valid.target_edge_type = short_valid.target_edge_type[mask]
-        short_valid = short_valid.to(device)
+        short_valid = [copy.deepcopy(vd) for vd in valid_data]
+        for graph in short_valid:
+            mask = torch.randperm(graph.target_edge_index.shape[1])[:num_val_edges]
+            graph.target_edge_index = graph.target_edge_index[:, mask]
+            graph.target_edge_type = graph.target_edge_type[mask]
+        
+        short_valid = [sv.to(device) for sv in short_valid]
 
-    train_data = train_data.to(device)
-    valid_data = valid_data.to(device)
-    test_data = test_data.to(device)
+    train_data = [td.to(device) for td in train_data]
+    valid_data = [vd.to(device) for vd in valid_data]
+    test_data = [tst.to(device) for tst in test_data]
+
     model = create_model(
         cfg,
         init=bool(cfg.train.get("init_model", True)),
@@ -820,60 +729,33 @@ if __name__ == "__main__":
     )
 
     model = model.to(device)
+  
+    assert task_name == "MultiGraphPretraining", "Only the MultiGraphPretraining task is allowed for this script"
 
     # for transductive setting, use the whole graph for filtered ranking
-    if task_name == "InductiveInference":
-        # filtering for inductive datasets
-        if "ILPC" in cfg.dataset['class'] or "Ingram" in cfg.dataset['class']:
-            full_inference_edges = torch.cat([valid_data.edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1)
-            full_inference_etypes = torch.cat([valid_data.edge_type, valid_data.target_edge_type, test_data.target_edge_type])
-            filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
-        else:
-            full_inference_edges = torch.cat([test_data.edge_index, test_data.target_edge_index], dim=1)
-            full_inference_etypes = torch.cat([test_data.edge_type, test_data.target_edge_type])
-            filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
-    else:
-        # for transductive setting
-        filtered_data = Data(
-            edge_index=torch.cat([train_data.target_edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1),
-            edge_type=torch.cat([train_data.target_edge_type, valid_data.target_edge_type, test_data.target_edge_type]),
-            num_nodes=train_data.num_nodes,
-        ).to(device)
-        val_filtered_data = test_filtered_data = filtered_data
-    
-    val_filtered_data = val_filtered_data.to(device)
-    test_filtered_data = test_filtered_data.to(device)
-
-    # test_encoder(cfg, model, test_data, filtered_data=test_filtered_data, device=device, logger=logger)
-
+    filtered_data = [
+        Data(
+            edge_index=torch.cat([trg.target_edge_index, valg.target_edge_index, testg.target_edge_index], dim=1), 
+            edge_type=torch.cat([trg.target_edge_type, valg.target_edge_type, testg.target_edge_type,]),
+            num_nodes=trg.num_nodes).to(device)
+        for trg, valg, testg in zip(train_data, valid_data, test_data)
+    ]
 
     # checkpoint_dir 相对 working_dir 解析（因未 chdir，需显式拼接）
     ckpt_dir = getattr(cfg.train, "checkpoint_dir", ".")
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    # 训练
-    train_and_validate(
-        cfg, 
-        model, 
-        train_data, 
-        valid_data if "fast_test" not in cfg.train else short_valid, 
-        device=device,
-        logger=logger,
-        filtered_data=filtered_data, 
-        batch_per_epoch=cfg.train.batch_per_epoch
-    )
-    logger.warning('start test')
-    # 评测
-    test(
-        cfg, 
-        model, 
-        test_data if "fast_test" not in cfg.train else short_valid,
-        device=device,
-        logger=logger,
-        filtered_data=filtered_data, 
-        split="test"
-    )
+    # train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=filtered_data, batch_per_epoch=cfg.train.batch_per_epoch)
     
-    if util.get_rank() == 0 and use_wandb and wandb is not None:
-        wandb.finish()
+
+    # # if util.get_rank() == 0:
+    # #     logger.warning(separator)
+    # #     logger.warning("Evaluate on valid")
+    # # test(cfg, model, valid_data, filtered_data=filtered_data)
+    # # if util.get_rank() == 0:
+    # #     logger.warning(separator)
+    # #     logger.warning("Evaluate on test")
+    # test(cfg, model, test_data, filtered_data=filtered_data, split="test")
+    # if util.get_rank() == 0 and use_wandb and wandb is not None:
+    #     wandb.finish()

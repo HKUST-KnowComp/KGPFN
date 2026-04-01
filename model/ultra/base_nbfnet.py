@@ -5,7 +5,8 @@ import torch
 from torch import nn, autograd
 
 from torch_scatter import scatter_add
-from . import tasks, layers
+from pfn import tasks
+from . import layers
 
 
 class BaseNBFNet(nn.Module):

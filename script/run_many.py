@@ -17,8 +17,7 @@ from torch.utils import data as torch_data
 from torch_geometric.data import Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from ultra import tasks, util
-from ultra.models import Ultra
+from pfn import util, datasets as pfn_datasets
 from script.run import train_and_validate, test
 
 
@@ -35,7 +34,6 @@ default_finetuning_config = {
     "DBpedia100k": (1, 1000),
     "AristoV4": (1, 2000),
     "ConceptNet100k": (1, 2000),
-    "ATOMIC": (1, 200),
     # tail-only datasets (2)
     "NELL995": (1, 'null'),  # not implemented yet
     "Hetionet": (1, 4000),
@@ -118,6 +116,110 @@ default_train_config = {
 separator = ">" * 30
 line = "-" * 30
 
+
+def _resolve_name_maps(data_obj):
+    id2e = getattr(data_obj, "train_id2entity", getattr(data_obj, "id2entity", {}))
+    id2r = getattr(data_obj, "train_id2relation", getattr(data_obj, "id2relation", {}))
+    return id2e, id2r
+
+
+def _debug_name_maps(train_data, valid_data, test_data, id2e, id2r, dataset_name=""):
+    """遍历图中所有实体/关系 ID，检查 id2e/id2r 是否覆盖，打印缺失项及图统计信息。"""
+    num_nodes = int(train_data.num_nodes)
+    num_relations = int(getattr(train_data, "num_relations", 0)) or int(train_data.target_edge_type.max()) + 1
+    base_rel = num_relations // 2
+
+    # 收集图中出现的所有 entity / relation ID
+    def _collect_ids(data):
+        eids, rids = set(), set()
+        if hasattr(data, "edge_index") and data.edge_index is not None:
+            eids.update(data.edge_index[0].tolist() + data.edge_index[1].tolist())
+        if hasattr(data, "target_edge_index"):
+            eids.update(data.target_edge_index[0].tolist() + data.target_edge_index[1].tolist())
+        if hasattr(data, "edge_type") and data.edge_type is not None:
+            rids.update(data.edge_type.tolist())
+        if hasattr(data, "target_edge_type"):
+            rids.update(data.target_edge_type.tolist())
+        return eids, rids
+
+    train_e, train_r = _collect_ids(train_data)
+    valid_e, valid_r = _collect_ids(valid_data)
+    test_e, test_r = _collect_ids(test_data)
+    all_entity_ids = train_e | valid_e | test_e
+    all_rel_ids = train_r | valid_r | test_r
+
+    # 图统计
+    print(f"\n========== {dataset_name} 图统计 ==========")
+    print(f"  num_nodes: {num_nodes}")
+    print(f"  num_relations (from edge_type): {num_relations}, base_rel: {base_rel}")
+    print(f"  train edges: {train_data.target_edge_index.shape[1]}, valid: {valid_data.target_edge_index.shape[1]}, test: {test_data.target_edge_index.shape[1]}")
+    e_range = f"[{min(all_entity_ids)}, {max(all_entity_ids)}]" if all_entity_ids else "[]"
+    r_range = f"[{min(all_rel_ids)}, {max(all_rel_ids)}]" if all_rel_ids else "[]"
+    print(f"  图中出现的 entity ID 数量: {len(all_entity_ids)}, 范围: {e_range}")
+    print(f"  图中出现的 relation ID 数量: {len(all_rel_ids)}, 范围: {r_range}")
+    print(f"  id2entity 条目数: {len(id2e)}, id2relation 条目数: {len(id2r)}")
+
+    # 检查 entity 覆盖
+    missing_entities = [e for e in sorted(all_entity_ids) if e not in id2e]
+    if missing_entities:
+        print(f"\n  [MISSING] 以下 entity ID 在 id2entity 中找不到:")
+        for e in missing_entities[:20]:
+            print(f"    entity id={e}")
+        if len(missing_entities) > 20:
+            print(f"    ... 共 {len(missing_entities)} 个")
+    else:
+        print(f"\n  [OK] 所有 entity ID 均在 id2entity 中有映射")
+
+    # 检查 relation 覆盖（含逆关系）
+    def _can_resolve_rel(r):
+        if r in id2r:
+            return True
+        if base_rel > 0 and r >= base_rel and (r - base_rel) in id2r:
+            return True
+        return False
+
+    missing_relations = [r for r in sorted(all_rel_ids) if not _can_resolve_rel(r)]
+    if missing_relations:
+        print(f"\n  [MISSING] 以下 relation ID 在 id2relation 中找不到（含逆关系 base_rel={base_rel}）:")
+        for r in missing_relations[:30]:
+            base_id = r - base_rel if base_rel > 0 and r >= base_rel else r
+            print(f"    relation id={r} (base_id={base_id}, base_id in id2r: {base_id in id2r})")
+        if len(missing_relations) > 30:
+            print(f"    ... 共 {len(missing_relations)} 个")
+    else:
+        print(f"\n  [OK] 所有 relation ID 均可解析（直接或逆关系）")
+
+    print("=" * 50)
+
+
+def _expand_dataset_variants(dataset_keys):
+    """
+    Expand base dataset keys to concrete dataset specs.
+    Example: FB15k237Inductive -> FB15k237Inductive:v1..v4
+    """
+    version_map = {
+        "FB15k237Inductive": ["v1", "v2", "v3", "v4"],
+        "WN18RRInductive": ["v1", "v2", "v3", "v4"],
+        "NELLInductive": ["v1", "v2", "v3", "v4"],
+        "NLIngram": ["0", "25", "50", "75", "100"],
+        "FBIngram": ["25", "50", "75", "100"],
+        "WKIngram": ["25", "50", "75", "100"],
+        "WikiTopicsMT1": ["tax", "health"],
+        "WikiTopicsMT2": ["org", "sci"],
+        "WikiTopicsMT3": ["art", "infra"],
+        "WikiTopicsMT4": ["sci", "health"],
+        "HM": ["1k", "3k", "5k", "indigo"],
+    }
+    expanded = []
+    for ds in dataset_keys:
+        versions = version_map.get(ds)
+        if versions:
+            expanded.extend([f"{ds}:{v}" for v in versions])
+        else:
+            expanded.append(ds)
+    return expanded
+
+
 def set_seed(seed):
     random.seed(seed + util.get_rank())
     # np.random.seed(seed + util.get_rank())
@@ -137,26 +239,49 @@ if __name__ == "__main__":
     parser.add_argument("-reps", "--repeats", help="number of times to repeat each exp", default=1, type=int)
     parser.add_argument("-ft", "--finetune", help="finetune the checkpoint on the specified datasets", action='store_true')
     parser.add_argument("-tr", "--train", help="train the model from scratch", action='store_true')
+    parser.add_argument("--start_from", type=str, default='FB15k237Inductive:v1', help="start loading from this dataset key, e.g. NELL23k")
     args, unparsed = parser.parse_known_args()
-   
-    datasets = args.datasets.split(",")
+
+    # 解析一次 config 中的动态变量（例如 ckpt、gpus 等），供所有数据集复用
+    dyn_vars = util.detect_variables(args.config)
+    dyn_parser = argparse.ArgumentParser()
+    for var in dyn_vars:
+        dyn_parser.add_argument(f"--{var}")
+    dyn_vals = dyn_parser.parse_known_args(unparsed)[0]
+    base_vars = {k: util.literal_eval(v) for k, v in dyn_vals._get_kwargs()}
+
+    # 如存在 checkpoint，只从磁盘加载一次，后续数据集直接复用内存中的 state
+    ckpt_path = base_vars.get("ckpt", None)
+    base_state = torch.load(ckpt_path, map_location="cpu") if ckpt_path is not None else None
+
+    dataset_args = args.datasets.split(",")
     path = os.path.dirname(os.path.expanduser(__file__))
     results_file = os.path.join(path, f"ultra_results_{time.strftime('%Y-%m-%d-%H-%M-%S')}.csv")
-
-    for graph in datasets:
+    datasets_list = list(default_finetuning_config.keys())
+    graphs_to_run = _expand_dataset_variants(datasets_list)
+    if args.start_from:
+        start_from = args.start_from.strip()
+        start_idx = None
+        for idx, graph in enumerate(graphs_to_run):
+            if graph == start_from or graph.split(":")[0] == start_from:
+                start_idx = idx
+                break
+        if start_idx is None:
+            raise RuntimeError(f"start_from `{start_from}` not found in expanded dataset list")
+        graphs_to_run = graphs_to_run[start_idx:]
+        print(f"Start from {graphs_to_run[0]}, remaining {len(graphs_to_run)} datasets")
+    graphs_to_run = ['FB15k237', 'WN18RR', 'CoDExMedium']
+    for graph in graphs_to_run:
         ds, version = graph.split(":") if ":" in graph else (graph, None)
+        if not hasattr(pfn_datasets, ds):
+            print(f"Skipping {graph}: pfn.datasets has no class `{ds}`")
+            continue
         for i in range(args.repeats):
             seed = seeds[i] if i < len(seeds) else random.randint(0, 10000)
             print(f"Running on {graph}, iteration {i+1} / {args.repeats}, seed: {seed}")
 
-            # get dynamic arguments defined in the config file
-            vars = util.detect_variables(args.config)
-            parser = argparse.ArgumentParser()
-            for var in vars:
-                parser.add_argument("--%s" % var)
-            vars = parser.parse_known_args(unparsed)[0]
-            vars = {k: util.literal_eval(v) for k, v in vars._get_kwargs()}
-
+            # 针对当前数据集构造 vars，在全局 base_vars 基础上覆盖 dataset / epochs / bpe / version
+            vars = dict(base_vars)
             if args.finetune:
                 epochs, batch_per_epoch = default_finetuning_config[ds] 
             elif args.train:
@@ -169,90 +294,87 @@ if __name__ == "__main__":
             if version is not None:
                 vars['version'] = version
             cfg = util.load_config(args.config, context=vars)
+            # Some config templates do not expose {{ version }}.
+            # Force-inject dataset version parsed from `DatasetName:version`.
+            if version is not None:
+                cfg.dataset["version"] = version
 
             root_dir = os.path.expanduser(cfg.output_dir) # resetting the path to avoid inf nesting
-            os.chdir(root_dir)
-            working_dir = util.create_working_directory(cfg)
-            set_seed(seed)
+            os.makedirs(root_dir, exist_ok=True)
+            # download-only mode: do not create timestamped working directories
+            # (avoids FileExistsError when multiple runs start in same second)
 
-            # args, vars = util.parse_args()
-            # cfg = util.load_config(args.config, context=vars)
-            # working_dir = util.create_working_directory(cfg)
-            # torch.manual_seed(args.seed + util.get_rank())
-            logger = util.get_root_logger()
-            if util.get_rank() == 0:
-                logger.warning("Random seed: %d" % seed)
-                logger.warning("Config file: %s" % args.config)
-                logger.warning(pprint.pformat(cfg))
+            # logger = util.get_root_logger()
+            # if util.get_rank() == 0:
+            #     logger.warning("Random seed: %d" % seed)
+            #     logger.warning("Config file: %s" % args.config)
+            #     logger.warning(pprint.pformat(cfg))
             
             task_name = cfg.task["name"]
             dataset = util.build_dataset(cfg)
             device = util.get_device(cfg)
             
             train_data, valid_data, test_data = dataset[0], dataset[1], dataset[2]
-            train_data = train_data.to(device)
-            valid_data = valid_data.to(device)
-            test_data = test_data.to(device)
-
-            model = Ultra(
-                rel_model_cfg=cfg.model.relation_model,
-                entity_model_cfg=cfg.model.entity_model,
-            )
-
-            if "checkpoint" in cfg and cfg.checkpoint is not None:
-                state = torch.load(cfg.checkpoint, map_location="cpu")
-                model.load_state_dict(state["model"])
-
-            #model = pyg.compile(model, dynamic=True)
-            model = model.to(device)
+            id2e, id2r = _resolve_name_maps(train_data)
+            _debug_name_maps(train_data, valid_data, test_data, id2e, id2r, dataset_name=graph)
             
-            if task_name == "InductiveInference":
-                # filtering for inductive datasets
-                # Grail, MTDEA, HM datasets have validation sets based off the training graph
-                # ILPC, Ingram have validation sets from the inference graph
-                # filtering dataset should contain all true edges (base graph + (valid) + test) 
-                if "ILPC" in cfg.dataset['class'] or "Ingram" in cfg.dataset['class']:
-                    # add inference, valid, test as the validation and test filtering graphs
-                    full_inference_edges = torch.cat([valid_data.edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1)
-                    full_inference_etypes = torch.cat([valid_data.edge_type, valid_data.target_edge_type, test_data.target_edge_type])
-                    test_filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
-                    val_filtered_data = test_filtered_data
-                else:
-                    # test filtering graph: inference edges + test edges
-                    full_inference_edges = torch.cat([test_data.edge_index, test_data.target_edge_index], dim=1)
-                    full_inference_etypes = torch.cat([test_data.edge_type, test_data.target_edge_type])
-                    test_filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
-
-                    # validation filtering graph: train edges + validation edges
-                    val_filtered_data = Data(
-                        edge_index=torch.cat([train_data.edge_index, valid_data.target_edge_index], dim=1),
-                        edge_type=torch.cat([train_data.edge_type, valid_data.target_edge_type])
-                    )
-                #test_filtered_data = val_filtered_data = None
-            else:
-                # for transductive setting, use the whole graph for filtered ranking
-                filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes)
-                val_filtered_data = test_filtered_data = filtered_data
+            break
+            # # 针对当前实验实例化模型，并用预加载的 checkpoint 初始化（如有）
+            # model = Ultra(
+            #     rel_model_cfg=cfg.model.relation_model,
+            #     entity_model_cfg=cfg.model.entity_model,
+            # )
+            # if base_state is not None:
+            #     model.load_state_dict(base_state["model"])
+            # model = model.to(device)
             
-            val_filtered_data = val_filtered_data.to(device)
-            test_filtered_data = test_filtered_data.to(device)
-            
-            train_and_validate(cfg, model, train_data, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
-            if util.get_rank() == 0:
-                logger.warning(separator)
-                logger.warning("Evaluate on valid")
-            test(cfg, model, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
-            if util.get_rank() == 0:
-                logger.warning(separator)
-                logger.warning("Evaluate on test")
-            metrics = test(cfg, model, test_data, filtered_data=test_filtered_data, return_metrics=True, device=device, logger=logger)
+            # if task_name == "InductiveInference":
+            #     # filtering for inductive datasets
+            #     # Grail, MTDEA, HM datasets have validation sets based off the training graph
+            #     # ILPC, Ingram have validation sets from the inference graph
+            #     # filtering dataset should contain all true edges (base graph + (valid) + test) 
+            #     if "ILPC" in cfg.dataset['class'] or "Ingram" in cfg.dataset['class']:
+            #         # add inference, valid, test as the validation and test filtering graphs
+            #         full_inference_edges = torch.cat([valid_data.edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1)
+            #         full_inference_etypes = torch.cat([valid_data.edge_type, valid_data.target_edge_type, test_data.target_edge_type])
+            #         test_filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
+            #         val_filtered_data = test_filtered_data
+            #     else:
+            #         # test filtering graph: inference edges + test edges
+            #         full_inference_edges = torch.cat([test_data.edge_index, test_data.target_edge_index], dim=1)
+            #         full_inference_etypes = torch.cat([test_data.edge_type, test_data.target_edge_type])
+            #         test_filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
 
-            metrics = {k:v.item() for k,v in metrics.items()}
-            metrics['dataset'] = graph
-            # write to the log file
-            with open(results_file, "a", newline='') as csv_file:
-                fieldnames = ['dataset']+list(metrics.keys())[:-1]
-                writer = csv.DictWriter(csv_file, fieldnames=fieldnames, delimiter=',')
-                if csv_file.tell() == 0:
-                    writer.writeheader()
-                writer.writerow(metrics)
+            #         # validation filtering graph: train edges + validation edges
+            #         val_filtered_data = Data(
+            #             edge_index=torch.cat([train_data.edge_index, valid_data.target_edge_index], dim=1),
+            #             edge_type=torch.cat([train_data.edge_type, valid_data.target_edge_type])
+            #         )
+            #     #test_filtered_data = val_filtered_data = None
+            # else:
+            #     # for transductive setting, use the whole graph for filtered ranking
+            #     filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes)
+            #     val_filtered_data = test_filtered_data = filtered_data
+            
+            # val_filtered_data = val_filtered_data.to(device)
+            # test_filtered_data = test_filtered_data.to(device)
+            
+            # train_and_validate(cfg, model, train_data, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
+            # if util.get_rank() == 0:
+            #     logger.warning(separator)
+            #     logger.warning("Evaluate on valid")
+            # test(cfg, model, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
+            # if util.get_rank() == 0:
+            #     logger.warning(separator)
+            #     logger.warning("Evaluate on test")
+            # metrics = test(cfg, model, test_data, filtered_data=test_filtered_data, return_metrics=True, device=device, logger=logger)
+
+            # metrics = {k:v.item() for k,v in metrics.items()}
+            # metrics['dataset'] = graph
+            # # write to the log file
+            # with open(results_file, "a", newline='') as csv_file:
+            #     fieldnames = ['dataset']+list(metrics.keys())[:-1]
+            #     writer = csv.DictWriter(csv_file, fieldnames=fieldnames, delimiter=',')
+            #     if csv_file.tell() == 0:
+            #         writer.writeheader()
+            #     writer.writerow(metrics)

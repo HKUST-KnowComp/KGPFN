@@ -3,9 +3,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ultra.query_utils import Stack, spmm_max
-from ultra.tasks import build_relation_graph, edge_match
-from ultra.base_nbfnet import index_to_mask
+from pfn.query_utils import Stack, spmm_max
+from pfn.tasks import build_relation_graph, edge_match
+from .base_nbfnet import index_to_mask
 from torch_geometric.data import Data,Batch
 
 
