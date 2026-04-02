@@ -1,11 +1,14 @@
-output_dir: /data/gaoyisen/ultrapfn2/output
+output_dir: /data/gaoyisen/pfn/output
 
 dataset:
   class: {{ dataset }}
-  root: /data/gaoyisen/ultrapfn2/kg-datasets/
+  root: /data/gaoyisen/ultrapfn3/kg-datasets2
 
 model:
   class: Ultra
+  # 设为 "none" / "null" 可禁用 structure encoder，仅使用 semantic encoder
+  # 默认 "ultra" 表示启用 StructureEncoderRelationAware
+  structure_encoder_name: ultra
   enhance_structure: False
   seq_chunk_size: 40  # 序列维度分块，避免 [B,S,num_nodes,D] OOM；null 则不分块
   relation_model:

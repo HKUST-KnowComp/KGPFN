@@ -9,7 +9,7 @@ class KGPFN(nn.Module):
     def __init__(
         self,
         *,
-        structure_encoder,
+        structure_encoder=None,
         semantic_encoder=None,
         feature_transformer,
         entity_dim: int = 64,
@@ -21,6 +21,10 @@ class KGPFN(nn.Module):
         context_label_correction: bool = False,
     ):
         super().__init__()
+        assert structure_encoder is not None or semantic_encoder is not None, \
+            "至少需要 structure_encoder 或 semantic_encoder 之一"
+        assert not (enhance_structure and structure_encoder is None), \
+            "enhance_structure=True 需要 structure_encoder"
         self.structure_encoder = structure_encoder
         self.semantic_encoder: Optional[Any] = semantic_encoder
         self.feature_transformer = feature_transformer
@@ -35,41 +39,41 @@ class KGPFN(nn.Module):
         # 是否启用 encoder 软标签修正（缓解 transductive 假负样本）
         self.context_label_correction = context_label_correction
 
-        # id / text 两路各自做 MLP 对齐，再做归一化
-        self.structure_adapter = nn.Sequential(
-            nn.Linear(self.entity_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.text_adapter = nn.Sequential(
-            nn.Linear(self.semantic_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.structure_norm = nn.LayerNorm(self.hidden_dim)
-        self.text_norm = nn.LayerNorm(self.hidden_dim)
-        # Triple-level structure enhancement adapter.
-        # Input: [TransE(h+r-t), DistMult(h*r*t), cos(h+r,t)] -> 3*D
-        # Output: per-token delta with shape [3, D].
-        dropout_rate = getattr(self, 'dropout', 0.0)  # 默认 0.1，可从外部配置
-        self.entity_adapter = nn.Sequential(
-            nn.Linear(2*self.entity_dim, self.hidden_dim),
-            nn.Dropout(dropout_rate),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.relation_adapter = nn.Sequential(
-            nn.Linear(self.relation_dim, self.hidden_dim),
-            nn.Dropout(dropout_rate),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.structure_enhance_adapter = nn.Sequential(
-            nn.Linear(3*self.hidden_dim , 3*self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(3*self.hidden_dim, 3*self.hidden_dim ),
+        dropout_rate = getattr(self, 'dropout', 0.0)
+
+        # 结构路模块：仅在有 structure_encoder 时创建
+        if structure_encoder is not None:
+            self.entity_adapter = nn.Sequential(
+                nn.Linear(2 * self.entity_dim, self.hidden_dim),
+                nn.Dropout(dropout_rate),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
             )
-        self.structure_enhance_norm = nn.LayerNorm(self.hidden_dim)
+            self.relation_adapter = nn.Sequential(
+                nn.Linear(self.relation_dim, self.hidden_dim),
+                nn.Dropout(dropout_rate),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            self.structure_norm = nn.LayerNorm(self.hidden_dim)
+            # Triple-level structure enhancement adapter.
+            # Input: [TransE(h+r-t), DistMult(h*r*t), cos(h+r,t)] -> 3*D
+            if enhance_structure:
+                self.structure_enhance_adapter = nn.Sequential(
+                    nn.Linear(3 * self.hidden_dim, 3 * self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(3 * self.hidden_dim, 3 * self.hidden_dim),
+                )
+                self.structure_enhance_norm = nn.LayerNorm(self.hidden_dim)
+
+        # 文本路模块：仅在有 semantic_encoder 时创建
+        if semantic_encoder is not None:
+            self.text_adapter = nn.Sequential(
+                nn.Linear(self.semantic_dim, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            self.text_norm = nn.LayerNorm(self.hidden_dim)
 
     def _triples_to_embeddings(self, data, all_triples: torch.Tensor):
         """
@@ -107,7 +111,6 @@ class KGPFN(nn.Module):
           - 3: 每行三元组对应 [h_text, r_text, t_text]
         使用 SentenceTransformer 风格 model.encode 后 reshape 为 [B, S, 3, D]。
         """
-        
 
         prefix = "the reverse relation of "
         inverse_mask_rows = []
@@ -135,8 +138,6 @@ class KGPFN(nn.Module):
             for row in sample:
                 flat_text.extend(row)
 
-      
-
         if hasattr(self.semantic_encoder, "encode"):
             sem = self.semantic_encoder.encode(
                 flat_text,
@@ -145,7 +146,7 @@ class KGPFN(nn.Module):
             )
         else:
             sem = self.semantic_encoder(flat_text)
-    
+
         # SentenceTransformer.encode may return inference tensors that cannot be
         # saved by autograd in downstream trainable layers (e.g., Linear).
         sem = sem.to(device).clone()
@@ -185,6 +186,53 @@ class KGPFN(nn.Module):
             new_y.append(y_i)
         return new_y
 
+    def _build_structure_aligned(
+        self,
+        data: Any,
+        all_id_triples: torch.Tensor,
+        num_context: int,
+        context_y: List[torch.Tensor],
+    ):
+        """
+        执行结构路编码，返回 (structure_aligned, context_y)。
+        structure_aligned: [B, S, 3, D] 或 enhance 后的 [B, S, 6, D]
+        """
+        bsz, seq_len, _ = all_id_triples.shape
+        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+
+        if self.context_label_correction:
+            with torch.no_grad():
+                ctx_scores = self.structure_encoder.get_mlp_scores(
+                    t_emb[:, :num_context]
+                )
+            context_y = self._apply_label_correction(ctx_scores, context_y)
+
+        h_emb = self.entity_adapter(h_emb)
+        r_emb = self.relation_adapter(r_emb)
+        t_emb = self.entity_adapter(t_emb)
+        id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
+        structure_aligned = self.structure_norm(id_feat)
+
+        if self.enhance_structure:
+            h_s = structure_aligned[:, :, 0, :]
+            r_s = structure_aligned[:, :, 1, :]
+            t_s = structure_aligned[:, :, 2, :]
+            transe_feat = h_s + r_s - t_s
+            distmult_feat = h_s * r_s * t_s
+            cos_feat = (
+                F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8)
+                .unsqueeze(-1)
+                .expand(-1, -1, self.hidden_dim)
+            )
+            enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
+            enh_delta = self.structure_enhance_adapter(enh_in).reshape(
+                bsz, seq_len, 3, self.hidden_dim
+            )
+            enh_delta = self.structure_enhance_norm(enh_delta)
+            structure_aligned = torch.cat([structure_aligned, enh_delta], dim=2)
+
+        return structure_aligned, context_y
+
     def forward(
         self,
         data: Any,
@@ -208,10 +256,15 @@ class KGPFN(nn.Module):
         其中 text 的最内层长度固定为 3，顺序为 [h_text, r_text, t_text]。
         模型内部会把 context/query 的 text 按序拼接成 [B, S, 3]（S=M+N），
         再用 semantic_encoder.encode(flatten_text) 得到 [B, S, 3, D]。
+
+        兼容模式：
+          - structure_encoder=None：纯语义路，text 必须提供
+          - semantic_encoder=None ：纯结构路，id 必须提供
+          - 两者均有：双路融合
         """
-        
+
         query_id, query_text, context_id, context_text = self._parse_dual_input(query_x, context_x)
-       
+
         bsz, num_query, _ = query_id.shape
         assert len(context_id) == bsz and len(context_y) == bsz, (
             f"context_x/context_y 长度应为 B={bsz}，实际为 {len(context_id)} / {len(context_y)}"
@@ -223,68 +276,36 @@ class KGPFN(nn.Module):
                 "当前实现要求每个 batch 行的 context 长度一致"
             )
 
-        # id 路输入拼接为 (B, M+N, 3)
+        # id 路拼接为 (B, M+N, 3)，无论是否用结构路都需要用于形状推断
         all_id_triples = torch.stack(
             [torch.cat([context_id[i].to(device), query_id[i].to(device)], dim=0) for i in range(bsz)],
             dim=0,
         )
         seq_len = all_id_triples.size(1)
 
-        # 1) id 路: structure encoder -> 三元组特征 [B, S, feature_dim]
-        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+        # 1) 结构路
+        structure_aligned = None
+        if self.structure_encoder is not None:
+            structure_aligned, context_y = self._build_structure_aligned(
+                data, all_id_triples, num_context, context_y
+            )
 
-        # 软标签修正：在 adapter 之前，t_emb 的维度即为 entity_model.mlp 的输入维度，
-        # 直接用上下文部分的 t_emb 计算 MLP 得分，无需额外的 bellmanford 计算
-        if self.context_label_correction:
-            with torch.no_grad():
-                ctx_scores = self.structure_encoder.get_mlp_scores(
-                    t_emb[:, :num_context]  # [B, M, feature_dim]
-                )
-            context_y = self._apply_label_correction(ctx_scores, context_y)
-
-        h_emb = self.entity_adapter(h_emb)
-        r_emb = self.relation_adapter(r_emb)
-        t_emb = self.entity_adapter(t_emb)
-        id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
-        structure_aligned = self.structure_norm(id_feat)
-        # 2) text 路: semantic encoder -> [B,S,3,D_sem]
-        # 若 semantic_encoder=None，则自动退化为纯结构分支（忽略 text 输入）
-        text_feat = None
+        # 2) 文本路
+        text_aligned = None
         if self.semantic_encoder is not None and query_text is not None and context_text is not None:
             all_text = [context_text[i] + query_text[i] for i in range(bsz)]  # [B, S, 3]
             text_feat = self._encode_semantic(all_text, bsz=bsz, seq_len=seq_len, device=device)
-           
-        # 3) 融合
-        # 仅在启用 semantic_encoder 时做 adapter + norm 融合；
-        # 否则走纯结构分支，直接使用 id_feat。
-        
-        if self.enhance_structure:
-            h_s = structure_aligned[:, :, 0, :]
-            r_s = structure_aligned[:, :, 1, :]
-            t_s = structure_aligned[:, :, 2, :]
-
-            # 1) TransE-style
-            transe_feat = h_s + r_s - t_s # [B,S,D]
-            # 2) DistMult-style (element-wise)
-            distmult_feat = h_s * r_s * t_s # [B,S,D]
-            # 3) RotatE-like cosine similarity between (h+r) and t
-            cos_feat = F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8).unsqueeze(-1)
-            cos_feat = cos_feat.expand(-1, -1, self.hidden_dim)
-
-            enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)  # [B,S,3D]
-            enh_delta = self.structure_enhance_adapter(enh_in).reshape(
-                structure_aligned.size(0), structure_aligned.size(1), 3, self.hidden_dim
-            )
-            enh_delta = self.structure_enhance_norm(enh_delta)
-            # Keep token layout [h, r, t] unchanged; enhance by residual update.
-            structure_aligned = torch.cat([structure_aligned, enh_delta], dim=2)
-
-        if text_feat is not None:
             text_aligned = self.text_norm(self.text_adapter(text_feat))
-            # Concatenate along token axis -> [B, S, 6, D]
-            fused_x = torch.cat([structure_aligned, text_aligned], dim=2)
-        else:
+
+        # 3) 融合
+        if structure_aligned is not None and text_aligned is not None:
+            fused_x = torch.cat([structure_aligned, text_aligned], dim=2)  # [B, S, 6+, D]
+        elif structure_aligned is not None:
             fused_x = structure_aligned
+        else:
+            assert text_aligned is not None, \
+                "structure_encoder=None 时必须提供文本输入（query_text / context_text）"
+            fused_x = text_aligned
 
         # y: 前 M 为 context 标签，后 N 为 query 占位 NaN
         y = torch.stack(
@@ -303,8 +324,7 @@ class KGPFN(nn.Module):
         eval_pos = num_context
 
         out = self.feature_transformer(fused_x, y, eval_pos=eval_pos, task_type=task_type)
-        
-      
+
         # reshape 为 [bsz, num_query]
         if out.dim() == 3:
             out = out.squeeze(-1)  # [B, N, 1] -> [B, N]
@@ -312,21 +332,9 @@ class KGPFN(nn.Module):
             out = out.view(bsz, num_query)  # [B*N] -> [B, N]
         elif out.dim() == 2 and out.size(0) == bsz * num_query:
             out = out.view(bsz, num_query)  # [B*N, 1] -> [B, N]
-        
-        
-        return out  # [bsz, num_query] 
 
-    # def get_scores(
-    #     self,
-    #     data: Any,
-    #     query_x,
-    #     context_x,
-    #     context_y: List[torch.Tensor],
-    #     task_type: Literal["reg", "cls"] = "reg",
-    # ) -> torch.Tensor:
-    #     out = self.forward(data, query_x, context_x, context_y, task_type)
-    #     return torch.sigmoid(out)
-    
+        return out  # [bsz, num_query]
+
     @torch.no_grad()
     def get_context_embeddings_cache(
         self,
@@ -351,139 +359,132 @@ class KGPFN(nn.Module):
         device = data.edge_index.device
         M = context_ids[0].size(0)
 
-        # 检查所有 context 长度一致
         for i in range(B):
             assert context_ids[i].size(0) == M, "所有 context 长度必须相同"
 
-        # 直接 stack 成 batch：[B, M, 3]
-        all_ctx_ids = torch.stack([cid.to(device) for cid in context_ids], dim=0)
+        all_ctx_ids = torch.stack([cid.to(device) for cid in context_ids], dim=0)  # [B, M, 3]
 
-        # 批量计算结构特征 [B, M, feature_dim]
-        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_ctx_ids)
+        # 结构路
+        structure_aligned = None
+        if self.structure_encoder is not None:
+            structure_aligned, context_ys = self._build_structure_aligned(
+                data, all_ctx_ids, M, context_ys
+            )
 
-        # 软标签修正：t_emb 在 adapter 之前，维度即 entity_model.mlp 输入维度，直接计算得分
-        if self.context_label_correction:
-            ctx_scores = self.structure_encoder.get_mlp_scores(t_emb)  # [B, M]
-            context_ys = self._apply_label_correction(ctx_scores, context_ys)
-        # 使用 adapter 对齐维度
-        h_emb = self.entity_adapter(h_emb)
-        r_emb = self.relation_adapter(r_emb)
-        t_emb = self.entity_adapter(t_emb)
-        id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)  # [B, M, 3, D]
-        
-        # 结构特征对齐
-        structure_aligned = self.structure_norm(id_feat)
-        
-        # 结构增强（与 forward 保持一致）
-        if self.enhance_structure:
-            h_s = structure_aligned[:, :, 0, :]
-            r_s = structure_aligned[:, :, 1, :]
-            t_s = structure_aligned[:, :, 2, :]
-            
-            transe_feat = h_s + r_s - t_s
-            distmult_feat = h_s * r_s * t_s
-            cos_feat = F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8).unsqueeze(-1)
-            cos_feat = cos_feat.expand(-1, -1, self.hidden_dim)
-            
-            enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
-            enh_delta = self.structure_enhance_adapter(enh_in).reshape(B, M, 3, self.hidden_dim)
-            enh_delta = self.structure_enhance_norm(enh_delta)
-            structure_aligned = torch.cat([structure_aligned, enh_delta], dim=2)  # [B, M, 6, D]
-        
-        # 可选：添加文本特征
+        # 文本路
+        text_aligned = None
         if self.semantic_encoder is not None and context_texts is not None:
-            # 批量编码所有文本 [B, M, 3]
             all_texts = [[context_texts[i][j] for j in range(M)] for i in range(B)]
             text_feat = self._encode_semantic(all_texts, bsz=B, seq_len=M, device=device)
-            text_aligned = self.text_norm(self.text_adapter(text_feat))  # [B, M, 3, D]
-            if self.enhance_structure:
-                text_aligned = torch.cat([text_aligned, text_aligned], dim=2)  # [B, M, 6, D]
+            text_aligned = self.text_norm(self.text_adapter(text_feat))
+
+        # 融合
+        if structure_aligned is not None and text_aligned is not None:
             fused_x = torch.cat([structure_aligned, text_aligned], dim=2)
-        else:
+        elif structure_aligned is not None:
             fused_x = structure_aligned
-        
+        else:
+            assert text_aligned is not None, \
+                "structure_encoder=None 时 context_texts 不能为 None"
+            fused_x = text_aligned
+
         return fused_x, context_ys  # [B, M, *, D] and (possibly relabeled) labels
-        
+
     @torch.no_grad()
     def get_scores(
         self,
         data: Any,
-        query_x: torch.Tensor,
+        query_x,
         context_cache: torch.Tensor,
         context_y: List[torch.Tensor],
         task_type: Literal["reg", "cls"] = "reg",
     ) -> torch.Tensor:
         """
         根据 query 和缓存的 context embedding 计算分数。
-        
+
         Args:
             data: 图数据
-            query_x: [B, N, 3] query 三元组 (h, t, r)
+            query_x: [B, N, 3] Tensor 或 {"id": ..., "text": ...} dict
             context_cache: [B, M, *, D] 预计算的 context embedding
             context_y: B 个 [M] context 标签
             task_type: "reg" 或 "cls"
-            
+
         Returns:
             scores: [B, N] 每个 query 的分数
         """
-        device = query_x.device
-        B, N, _ = query_x.shape
+        query_id, query_text, _, _ = self._parse_dual_input(query_x, [])
+        device = query_id.device
+        B, N, _ = query_id.shape
         M = context_cache.size(1)
-        
-        # 1) 计算 query 的 embedding
-        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, query_x)
-        # 使用 adapter 对齐维度
-        h_emb = self.entity_adapter(h_emb)
-        r_emb = self.relation_adapter(r_emb)
-        t_emb = self.entity_adapter(t_emb)
-        query_id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)  # [B, N, 3, D]
-        
-        # 结构对齐
-        query_structure = self.structure_norm(query_id_feat)
-        
-        # 结构增强
-        if self.enhance_structure:
-            h_s = query_structure[:, :, 0, :]
-            r_s = query_structure[:, :, 1, :]
-            t_s = query_structure[:, :, 2, :]
-            
-            transe_feat = h_s + r_s - t_s
-            distmult_feat = h_s * r_s * t_s
-            cos_feat = F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8).unsqueeze(-1)
-            cos_feat = cos_feat.expand(-1, -1, self.hidden_dim)
-            
-            enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
-            enh_delta = self.structure_enhance_adapter(enh_in).reshape(B, N, 3, self.hidden_dim)
-            enh_delta = self.structure_enhance_norm(enh_delta)
-            query_structure = torch.cat([query_structure, enh_delta], dim=2)  # [B, N, 6, D]
-        
-        # 2) 拼接 context 和 query
-        full_fused = torch.cat([context_cache, query_structure], dim=1)  # [B, M+N, *, D]
-        
-        # 3) 构建 y：context 标签 + query 占位 NaN
-        y_list = []
-        for i in range(B):
-            y_row = torch.cat([
-                context_y[i].to(device).to(torch.float32),
-                torch.full((N,), float("nan"), device=device, dtype=torch.float32),
-            ], dim=0)
-            y_list.append(y_row)
-        y = torch.stack(y_list, dim=0)  # [B, M+N]
-        
-        # 4) 通过 transformer
+
+        # 结构路
+        query_structure = None
+        if self.structure_encoder is not None:
+            h_emb, r_emb, t_emb = self._triples_to_embeddings(data, query_id)
+            h_emb = self.entity_adapter(h_emb)
+            r_emb = self.relation_adapter(r_emb)
+            t_emb = self.entity_adapter(t_emb)
+            query_id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
+            query_structure = self.structure_norm(query_id_feat)
+
+            if self.enhance_structure:
+                h_s = query_structure[:, :, 0, :]
+                r_s = query_structure[:, :, 1, :]
+                t_s = query_structure[:, :, 2, :]
+                transe_feat = h_s + r_s - t_s
+                distmult_feat = h_s * r_s * t_s
+                cos_feat = (
+                    F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8)
+                    .unsqueeze(-1)
+                    .expand(-1, -1, self.hidden_dim)
+                )
+                enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
+                enh_delta = self.structure_enhance_adapter(enh_in).reshape(B, N, 3, self.hidden_dim)
+                enh_delta = self.structure_enhance_norm(enh_delta)
+                query_structure = torch.cat([query_structure, enh_delta], dim=2)
+
+        # 文本路
+        query_text_aligned = None
+        if self.semantic_encoder is not None and query_text is not None:
+            text_feat = self._encode_semantic(query_text, bsz=B, seq_len=N, device=device)
+            query_text_aligned = self.text_norm(self.text_adapter(text_feat))
+
+        # 融合 query embedding
+        if query_structure is not None and query_text_aligned is not None:
+            query_fused = torch.cat([query_structure, query_text_aligned], dim=2)
+        elif query_structure is not None:
+            query_fused = query_structure
+        else:
+            assert query_text_aligned is not None, \
+                "structure_encoder=None 时必须在 query_x 中提供 text"
+            query_fused = query_text_aligned
+
+        # 拼接 context 和 query
+        full_fused = torch.cat([context_cache, query_fused], dim=1)  # [B, M+N, *, D]
+
+        # 构建 y：context 标签 + query 占位 NaN
+        y = torch.stack(
+            [
+                torch.cat([
+                    context_y[i].to(device).to(torch.float32),
+                    torch.full((N,), float("nan"), device=device, dtype=torch.float32),
+                ], dim=0)
+                for i in range(B)
+            ],
+            dim=0,
+        )
+
         eval_pos = M
         out = self.feature_transformer(full_fused, y, eval_pos=eval_pos, task_type=task_type)
-        
-        # 确保输出形状为 [B, N]
-        # 如果输出是 [B*N] 或 [B*N, 1]，需要 reshape
+
         if out.numel() == B * N:
             if out.dim() == 1:
                 out = out.view(B, N)
             elif out.dim() == 2 and out.size(0) == B * N:
                 out = out.view(B, N, -1).squeeze(-1)
-        
-        return out  # [B, N] 
-    
+
+        return out  # [B, N]
+
 
 class LabelSmoothingLoss(torch.nn.Module):
     def __init__(self, smoothing: float = 0.1,

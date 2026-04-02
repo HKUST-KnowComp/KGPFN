@@ -41,6 +41,19 @@ def _build_semantic_encoder(cfg):
         return SentenceTransformer(sem_name)
 
 
+def _build_structure_encoder(cfg):
+    name = str(cfg.model.get("structure_encoder_name", "ultra")).strip()
+    if name.lower() in ("", "none", "null"):
+        return None
+    entity_model_cfg = copy.deepcopy(cfg.model.entity_model)
+    entity_chunk_size = entity_model_cfg.pop("entity_chunk_size", None)
+    return StructureEncoderRelationAware(
+        rel_model_cfg=copy.deepcopy(cfg.model.relation_model),
+        entity_model_cfg=entity_model_cfg,
+        entity_chunk_size=entity_chunk_size,
+    )
+
+
 def _set_module_trainable(module, trainable: bool):
     if module is None:
         return
@@ -202,13 +215,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     - init=True: 按 create_init_model 思路分别初始化 structure_encoder 与 feature_transformer
     - ckpt_path: 若提供，则在上述步骤后再加载整体 checkpoint 权重（优先级最高）
     """
-    entity_model_cfg = copy.deepcopy(cfg.model.entity_model)
-    entity_chunk_size = entity_model_cfg.pop("entity_chunk_size", None)
-    structure_encoder = StructureEncoderRelationAware(
-        rel_model_cfg=copy.deepcopy(cfg.model.relation_model),
-        entity_model_cfg=entity_model_cfg,
-        entity_chunk_size=entity_chunk_size,
-    )
+    structure_encoder = _build_structure_encoder(cfg)
 
     # feature_transformer 结构由本地 limix config 决定（统一与 cfg 对齐）
     yaml_path = _get_limix_config_path(cfg)
@@ -243,7 +250,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         print("Initializing model...")
         # 1) 初始化 structure encoder
         structure_encoder_path = cfg.train.get("structure_encoder_path", None)
-        if structure_encoder_path and os.path.exists(structure_encoder_path):
+        if model.structure_encoder is not None and structure_encoder_path and os.path.exists(structure_encoder_path):
             state = torch.load(structure_encoder_path, map_location=map_location)
             sd = state["model"] if isinstance(state, dict) and "model" in state else state
             model.structure_encoder.load_state_dict(sd, strict=False)
