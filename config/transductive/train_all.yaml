@@ -1,12 +1,31 @@
-output_dir: /data/gaoyisen/ultrapfn2/output
+output_dir: /data/gaoyisen/pfn/output
 
 dataset:
   class: JointDataset
-  graphs: all
-  root: ./kg-datasets/
+  graphs: ["FB15k237Inductive:v1", "FB15k237Inductive:v2"]
+  # --- graphs 选项说明 ---
+  # 仅 all（不含 Atlas）：
+  #   graphs: all
+  # 仅 Atlas small 全部图：
+  #   graphs: "Atlas:small"
+  # 仅 Atlas one_hop 全部图：
+  #   graphs: "Atlas:one_hop"
+  # all + Atlas:small + Atlas:one_hop（逗号分隔字符串）：
+  #   graphs: "all,Atlas:small,Atlas:one_hop"
+  # 或写成 YAML 列表：
+  #   graphs:
+  #     - all
+  #     - "Atlas:small"
+  #     - "Atlas:one_hop"
+  # 指定单个 Atlas 图（small 第0号）：
+  #   graphs: "Atlas:small:0"
+  root: /data/gaoyisen/ultrapfn3/kg-datasets2
 
 model:
   class: Ultra
+  # 设为 "none" / "null" 可禁用 structure encoder，仅使用 semantic encoder
+  # 默认 "ultra" 表示启用 StructureEncoderRelationAware
+  structure_encoder_name: ultra
   enhance_structure: False
   seq_chunk_size: 40  # 序列维度分块，避免 [B,S,num_nodes,D] OOM；null 则不分块
   relation_model:
@@ -27,7 +46,7 @@ model:
     short_cut: yes
     layer_norm: yes
   semantic_encoder:
-    model_name: none # none, all-MiniLM-L12-v2, local path
+    model_name: all-MiniLM-L12-v2 # none, all-MiniLM-L12-v2, local path
     dim: 384
 
 task:
@@ -52,14 +71,16 @@ train:
   # train params
   gpus: {{ gpus }}
   batch_size: 60
-  num_epoch: 100
+  num_epoch: 0
   log_interval: 50
   batch_per_epoch: 400
   valid_eval_step_interval: 400
- 
+  
   # eval params
-  fast_test: 400
+  fast_test: 2
   eval_chunk_size: 256
+
+  use_accelerate: true
 
   # log params（不配置 log_file 时默认写入 working_dir/pretrain_pfn.log）
   max_checkpoints: 10  # 最多保留的 step checkpoint 数量（model_best 始终保留）

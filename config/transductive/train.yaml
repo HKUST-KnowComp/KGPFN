@@ -1,14 +1,14 @@
 output_dir: /data/gaoyisen/pfn/output
 
 dataset:
-  class: {{ dataset }}
+  class: Atlas 
   root: /data/gaoyisen/ultrapfn3/kg-datasets2
-
+  version: small:0       # 版本，表示 small 图的第 0 个
 model:
   class: Ultra
   # 设为 "none" / "null" 可禁用 structure encoder，仅使用 semantic encoder
   # 默认 "ultra" 表示启用 StructureEncoderRelationAware
-  structure_encoder_name: ultra
+  structure_encoder_name: none
   enhance_structure: False
   seq_chunk_size: 40  # 序列维度分块，避免 [B,S,num_nodes,D] OOM；null 则不分块
   relation_model:
@@ -29,7 +29,7 @@ model:
     short_cut: yes
     layer_norm: yes
   semantic_encoder:
-    model_name: none # none, all-MiniLM-L12-v2, local path
+    model_name: all-MiniLM-L12-v2 # none, all-MiniLM-L12-v2, local path
     dim: 384
 
 task:
@@ -53,7 +53,7 @@ optimizer:
 train:
   # train params
   gpus: {{ gpus }}
-  batch_size: 40
+  batch_size: 1
   num_epoch: 50
   log_interval: 50
   batch_per_epoch: 400

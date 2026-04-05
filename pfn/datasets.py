@@ -3658,6 +3658,7 @@ class JointDataset(InMemoryDataset):
         'WDsinger': WDsinger,
         'NELL23k': NELL23k, 
        # inductive  new nodes no new relations 18个
+       'FB15k237Inductive': FB15k237Inductive,
        # FB15k237Inductiv(4个),wn18rrinductive(4个),nellinductive(4个)
        'ILPC2022': ILPC2022, #small ,large 2个
        'HM': HM, #1k,3k,5k,indigo 4个

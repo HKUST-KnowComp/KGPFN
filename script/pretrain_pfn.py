@@ -8,8 +8,6 @@ import logging
 import io
 import contextlib
 import yaml
-from itertools import islice
-from functools import partial
 from typing import Any
 
 import torch
@@ -19,6 +17,12 @@ from torch.nn import functional as F
 from torch import distributed as dist
 from torch.utils import data as torch_data
 from torch_geometric.data import Data
+
+try:
+    from accelerate import Accelerator
+    _ACCELERATE_AVAILABLE = True
+except ImportError:
+    _ACCELERATE_AVAILABLE = False
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from pfn import tasks, util
@@ -282,36 +286,43 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     return model
 
 
-def multigraph_collator(batch, train_graphs):
-    num_graphs = len(train_graphs)
-    probs = torch.tensor([graph.edge_index.shape[1] for graph in train_graphs]).float()
-    probs /= probs.sum()
-    graph_id = torch.multinomial(probs, 1, replacement=False).item()
-
-    graph = train_graphs[graph_id]
-    bs = len(batch)
-    edge_mask = torch.randperm(graph.target_edge_index.shape[1])[:bs]
-
-    batch = torch.cat([graph.target_edge_index[:, edge_mask], graph.target_edge_type[edge_mask].unsqueeze(0)]).t()
-    return graph, batch
-
 # here we assume that train_data and valid_data are tuples of datasets
-def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, batch_per_epoch=None):
+def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, batch_per_epoch=None, accelerator=None):
+    """
+    accelerator: optional Accelerator instance.
+      - If provided: uses accelerator.prepare() for DDP + mixed precision,
+        accelerator.backward() for loss, and accelerator.unwrap_model() for saves.
+      - If None: falls back to manual DDP (original behavior).
+      In both cases, graph selection is synchronized via dist.broadcast so all
+      ranks always process the same graph per step (fixes DDP timeout from load imbalance).
+    """
 
     if cfg.train.num_epoch == 0:
         return
 
-    world_size = util.get_world_size()
-    rank = util.get_rank()
+    if accelerator is not None:
+        world_size = accelerator.num_processes
+        rank = accelerator.process_index
+        is_main = accelerator.is_main_process
+        _device = accelerator.device
+    else:
+        world_size = util.get_world_size()
+        rank = util.get_rank()
+        is_main = (rank == 0)
+        _device = device
 
-    train_triplets = torch.cat([
-        torch.cat([g.target_edge_index, g.target_edge_type.unsqueeze(0)]).t()
-        for g in train_data
-    ])
-    sampler = torch_data.DistributedSampler(train_triplets, world_size, rank)
-    train_loader = torch_data.DataLoader(train_triplets, cfg.train.batch_size, sampler=sampler, collate_fn=partial(multigraph_collator, train_graphs=train_data))
+    # Fallback: roughly one pass through all training triplets
+    if batch_per_epoch is None:
+        total = sum(g.target_edge_index.shape[1] for g in train_data)
+        batch_per_epoch = max(1, total // (cfg.train.batch_size * world_size))
 
-    batch_per_epoch = batch_per_epoch or len(train_loader)
+    # Graph selection probabilities proportional to graph size (same as original collator)
+    graph_probs = torch.tensor(
+        [g.edge_index.shape[1] for g in train_data], dtype=torch.float, device=_device
+    )
+    graph_probs /= graph_probs.sum()
+    # Shared buffer for broadcasting the selected graph index across ranks
+    graph_id_buf = torch.zeros(1, dtype=torch.long, device=_device)
 
     cls = cfg.optimizer.pop("class")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -320,7 +331,10 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     logger.warning(line)
     logger.warning(f"Number of parameters: {num_params}")
 
-    if world_size > 1:
+    if accelerator is not None:
+        # accelerate handles DDP wrapping and device placement
+        parallel_model, optimizer = accelerator.prepare(model, optimizer)
+    elif world_size > 1:
         parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
     else:
         parallel_model = model
@@ -339,15 +353,29 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     for i in range(0, cfg.train.num_epoch, step):
         parallel_model.train()
         for epoch in range(i, min(cfg.train.num_epoch, i + step)):
-            if util.get_rank() == 0:
+            if is_main:
                 logger.warning(separator)
                 logger.warning("Epoch %d begin" % epoch)
 
             losses = []
-            sampler.set_epoch(epoch)
-            for batch in islice(train_loader, batch_per_epoch):
-                # now at each step we sample a new graph and edges from it
-                train_graph, batch = batch
+            for _ in range(batch_per_epoch):
+                # Rank 0 samples the graph; broadcast ensures all ranks use the same graph,
+                # eliminating the compute-time divergence that causes DDP timeout.
+                # This is necessary even with accelerate — no_sync/accumulate does NOT
+                # fix load imbalance between GPUs processing different-sized graphs.
+                if rank == 0:
+                    graph_id_buf[0] = torch.multinomial(graph_probs, 1).item()
+                if world_size > 1:
+                    dist.broadcast(graph_id_buf, src=0)
+                graph_id = int(graph_id_buf.item())
+                train_graph = train_data[graph_id]
+
+                bs = cfg.train.batch_size
+                perm = torch.randperm(train_graph.target_edge_index.shape[1], device=_device)[:bs]
+                batch = torch.cat([
+                    train_graph.target_edge_index[:, perm],
+                    train_graph.target_edge_type[perm].unsqueeze(0),
+                ]).t()
 
                 # 1) 负采样得到 (B, N, 3) 的 query 三元组
                 batch_with_neg = tasks.negative_sampling_tail(
@@ -397,14 +425,18 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                 loss = (loss_raw * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
                 loss = loss.mean()
 
-                loss.backward()
+                # accelerate handles gradient scaling for mixed precision automatically
+                if accelerator is not None:
+                    accelerator.backward(loss)
+                else:
+                    loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
                 if batch_id % cfg.train.log_interval == 0:
                     logger.warning(separator)
                     logger.warning("binary cross entropy: %g" % loss.item())
-                    if use_wandb and util.get_rank() == 0 and wandb is not None:
+                    if use_wandb and is_main and wandb is not None:
                         wandb.log(
                             {
                                 "train/loss_step": loss.item(),
@@ -418,11 +450,12 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
 
                 # 可选：每隔若干个 step 在 valid 上评估一次；仅当 valid MRR 创新高时保存 model_best.pth
                 if valid_eval_step_interval > 0 and (batch_id % valid_eval_step_interval == 0):
-                    if util.get_rank() == 0:
+                    if is_main:
                         logger.warning(separator)
                         logger.warning("Evaluate on valid at step %d", batch_id)
-                    valid_mrr = test(cfg, model, valid_data, filtered_data=filtered_data, split="valid")
-                    if util.get_rank() == 0:
+                    _eval_model = accelerator.unwrap_model(parallel_model) if accelerator is not None else model
+                    valid_mrr = test(cfg, _eval_model, valid_data, filtered_data=filtered_data, split="valid")
+                    if is_main:
                         logger.warning("valid mrr: %g", valid_mrr)
                         if use_wandb and wandb is not None:
                             wandb.log(
@@ -437,8 +470,9 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                             best_mrr = valid_mrr_f
                             os.makedirs(checkpoint_dir, exist_ok=True)
                             best_path = os.path.join(checkpoint_dir, "model_best.pth")
+                            _save_model = accelerator.unwrap_model(parallel_model) if accelerator is not None else model
                             state = {
-                                "model": model.state_dict(),
+                                "model": _save_model.state_dict(),
                                 "optimizer": optimizer.state_dict(),
                                 "step": batch_id,
                                 "epoch": epoch,
@@ -454,21 +488,22 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
             logger.warning("Epoch %d end" % epoch)
             logger.warning(line)
             logger.warning("average binary cross entropy: %g" % avg_loss)
-            if use_wandb and util.get_rank() == 0 and wandb is not None:
+            if use_wandb and is_main and wandb is not None:
                 wandb.log(
                     {
                         "train/loss_epoch": avg_loss,
-                        "train/metric": avg_loss,  # 先以 epoch loss 作为主要监控 metric
+                        "train/metric": avg_loss,
                         "train/epoch": epoch,
                     },
                     step=batch_id,
                 )
 
-            if util.get_rank() == 0:
+            if is_main:
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 epoch_ckpt_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pth")
+                _save_model = accelerator.unwrap_model(parallel_model) if accelerator is not None else model
                 epoch_state = {
-                    "model": model.state_dict(),
+                    "model": _save_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": batch_id,
                     "epoch": epoch,
@@ -502,7 +537,14 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
     # process sequentially
     all_metrics = []
     collected_metric_values: dict[str, list[float]] = {}
-    for test_graph, filters in zip(test_data, filtered_data):
+    for graph_idx, (test_graph, filters) in enumerate(zip(test_data, filtered_data)):
+        graph_name = getattr(test_graph, "dataset", f"graph_{graph_idx}")
+        if rank == 0:
+            logger.warning(separator)
+            logger.warning("[%s/%s] Evaluating: %s (%d triples, %d nodes)",
+                           split, graph_idx, graph_name,
+                           test_graph.target_edge_index.shape[1],
+                           test_graph.num_nodes)
 
         test_triplets = torch.cat([test_graph.target_edge_index, test_graph.target_edge_type.unsqueeze(0)]).t()
         sampler = torch_data.DistributedSampler(test_triplets, world_size, rank)
@@ -657,17 +699,16 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                         score = (all_ranking <= threshold).float().mean()
                 else:
                     raise ValueError(f"Unknown metric: {metric}")
-                logger.warning("%s: %g" % (metric, score))
+                logger.warning("[%s] %s: %g", graph_name, metric, score)
                 graph_metrics[metric] = float(score.item())
         mrr = (1 / all_ranking.float()).mean()
 
         all_metrics.append(mrr)
         if rank == 0:
             graph_metrics["mrr"] = float(mrr.item())
+            logger.warning("[%s] mrr: %g", graph_name, graph_metrics["mrr"])
             for k, v in graph_metrics.items():
                 collected_metric_values.setdefault(k, []).append(v)
-        if rank == 0:
-            logger.warning(separator)
 
     avg_metric = sum(all_metrics) / len(all_metrics)
     if rank == 0 and wandb is not None and wandb.run is not None and collected_metric_values:
@@ -687,6 +728,24 @@ if __name__ == "__main__":
         val = cfg.train.get(key)
         if val:
             cfg.train[key] = _resolve_path(val, project_root)
+
+    # ── Accelerate setup ────────────────────────────────────────────────────────
+    # Enable via config: train.use_accelerate: true  (+ optional mixed_precision: "bf16")
+    # Launch with: accelerate launch --num_processes N script/pretrain_pfn.py -c ...
+    # or the existing: torchrun --nproc_per_node=N  (both work; accelerate detects either)
+    #
+    # NOTE: Accelerator() must be created BEFORE create_working_directory() so that
+    # torch.distributed is initialized by accelerate first, and create_working_directory's
+    # `if not dist.is_initialized()` guard correctly skips redundant init.
+    _use_accelerate = bool(cfg.train.get("use_accelerate", False))
+    if _use_accelerate:
+        assert _ACCELERATE_AVAILABLE, "use_accelerate=true but `accelerate` is not installed. Run: pip install accelerate"
+        _mixed_precision = cfg.train.get("mixed_precision", "no")
+        accelerator = Accelerator(mixed_precision=_mixed_precision)
+    else:
+        accelerator = None
+    # ────────────────────────────────────────────────────────────────────────────
+
     working_dir = util.create_working_directory(cfg, chdir=False)
 
     if util.get_rank() == 0:
@@ -718,7 +777,7 @@ if __name__ == "__main__":
     
     task_name = cfg.task["name"]
     dataset = util.build_dataset(cfg)
-    device = util.get_device(cfg)
+    device = accelerator.device if accelerator is not None else util.get_device(cfg)
     
     train_data, valid_data, test_data = dataset._data[0], dataset._data[1], dataset._data[2]
     
@@ -749,21 +808,33 @@ if __name__ == "__main__":
   
     assert task_name == "MultiGraphPretraining", "Only the MultiGraphPretraining task is allowed for this script"
 
-    # for transductive setting, use the whole graph for filtered ranking
-    filtered_data = [
-        Data(
-            edge_index=torch.cat([trg.target_edge_index, valg.target_edge_index, testg.target_edge_index], dim=1), 
-            edge_type=torch.cat([trg.target_edge_type, valg.target_edge_type, testg.target_edge_type,]),
-            num_nodes=trg.num_nodes).to(device)
-        for trg, valg, testg in zip(train_data, valid_data, test_data)
-    ]
+    # Build per-split filtered data using each target graph's own edge space and node count.
+    #
+    # Using each graph's edge_index (the context graph) + target_edge_index (prediction targets)
+    # correctly handles both transductive and inductive settings:
+    #   - Transductive: edge_index already contains all edges; num_nodes is shared.
+    #   - Inductive: test entities differ from train entities; using test_graph.num_nodes
+    #     fixes the shape mismatch (test_graph.num_nodes != train_graph.num_nodes) that
+    #     caused compute_ranking to crash with mismatched tensor dimensions.
+    def _make_filtered_data(graphs):
+        return [
+            Data(
+                edge_index=torch.cat([g.edge_index, g.target_edge_index], dim=1),
+                edge_type=torch.cat([g.edge_type, g.target_edge_type]),
+                num_nodes=g.num_nodes,
+            ).to(device)
+            for g in graphs
+        ]
+
+    valid_filtered_data = _make_filtered_data(valid_data)
+    test_filtered_data = _make_filtered_data(test_data)
 
     # checkpoint_dir 相对 working_dir 解析（因未 chdir，需显式拼接）
     ckpt_dir = getattr(cfg.train, "checkpoint_dir", ".")
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=filtered_data, batch_per_epoch=cfg.train.batch_per_epoch)
+    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
     
 
     # if util.get_rank() == 0:
@@ -773,6 +844,6 @@ if __name__ == "__main__":
     # if util.get_rank() == 0:
     #     logger.warning(separator)
     #     logger.warning("Evaluate on test")
-    test(cfg, model, test_data, filtered_data=filtered_data, split="test")
+    test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
     if util.get_rank() == 0 and use_wandb and wandb is not None:
         wandb.finish()
