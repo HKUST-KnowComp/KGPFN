@@ -6,6 +6,7 @@ import time
 import hashlib
 import torch
 import yaml
+import re
 import requests
 from torch_geometric.data import Data, InMemoryDataset, download_url, extract_zip
 from torch_geometric.utils import index_sort
@@ -3442,17 +3443,22 @@ class Atlas(InMemoryDataset):
         self.graph_idx = graph_idx
         self.split_seed = int(split_seed)
 
+        # 将 Atlas 数据固定放在 root/atlas/ 子目录下，和其他数据集保持一致风格
+        # （例如 FB15k237 在 root/fb15k237/...）
+        self._atlas_root = os.path.join(root, "atlas")
+
         super().__init__(root, transform, pre_transform)
         self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def raw_dir(self):
-        return os.path.join(self.root, "splits_%s" % self.graph_name)
+        # e.g. <root>/atlas/splits_small 或 <root>/atlas/splits_one_hop
+        return os.path.join(self._atlas_root, f"splits_{self.graph_name}")
 
     @property
     def processed_dir(self):
         return os.path.join(
-            self.root,
+            self._atlas_root,
             "processed_atlas",
             f"{self.graph_name}-{self.graph_idx:04d}",
             "processed",
@@ -3464,12 +3470,12 @@ class Atlas(InMemoryDataset):
 
     def process(self):
         nodes_csv = os.path.join(
-            self.root,
+            self._atlas_root,
             f"splits_{self.graph_name}",
             f"{self.graph_name}_{self.graph_idx:04d}_nodes.csv",
         )
         edges_csv = os.path.join(
-            self.root,
+            self._atlas_root,
             f"splits_{self.graph_name}",
             f"{self.graph_name}_{self.graph_idx:04d}_edges.csv",
         )
@@ -3662,6 +3668,8 @@ class JointDataset(InMemoryDataset):
        'WikiTopicsMT4': WikiTopicsMT4, #sci, health 2个
        'Metafam': Metafam,
        'FBNELL': FBNELL,
+       # Atlas: individual graphs specified as Atlas:small:0, Atlas:one_hop:0 etc.
+       # Use Atlas:small or Atlas:one_hop to auto-expand all available graphs.
        'Atlas': Atlas,
     }
 
@@ -3671,19 +3679,27 @@ class JointDataset(InMemoryDataset):
         # - graphs item: "Name" -> if class has `versions`, expand to all versions
         # - graphs item: "Name:version" -> load a specific version
         if isinstance(graphs, str):
-            graphs = [graphs]
+            # Support comma-separated string: "all,Atlas:small,Atlas:one_hop"
+            graphs = [g.strip() for g in graphs.split(",") if g.strip()]
         graphs = list(graphs)
 
-        if len(graphs) == 1 and str(graphs[0]).strip().lower() == "all":
-            graphs = list(self.datasets_map.keys())
-
-        expanded_specs: list[str] = []
+        # Pre-expand "all" keyword before the main loop so each resulting key
+        # goes through the per-dataset version expansion logic below.
+        pre_expanded = []
         for spec in graphs:
             spec_s = str(spec).strip()
             if not spec_s:
                 continue
             if spec_s.lower() == "all":
-                expanded_specs.extend(list(self.datasets_map.keys()))
+                pre_expanded.extend(k for k in self.datasets_map.keys() if k != "Atlas")
+            else:
+                pre_expanded.append(spec_s)
+        graphs = pre_expanded
+
+        expanded_specs: list[str] = []
+        for spec in graphs:
+            spec_s = str(spec).strip()
+            if not spec_s:
                 continue
 
             if ":" in spec_s:
@@ -3693,12 +3709,37 @@ class JointDataset(InMemoryDataset):
             else:
                 ds_name, ds_version = spec_s, None
 
-            ds_cls = self.datasets_map.get(ds_name)
-            if ds_cls is None:
-                raise KeyError(
-                    f"Unknown dataset key '{ds_name}' for JointDataset. "
-                    f"Available keys: {sorted(self.datasets_map.keys())}"
-                )
+            # Case-insensitive lookup for dataset name
+            if ds_name not in self.datasets_map:
+                lower_map = {k.lower(): k for k in self.datasets_map}
+                canonical = lower_map.get(ds_name.lower())
+                if canonical is None:
+                    raise KeyError(
+                        f"Unknown dataset key '{ds_name}' for JointDataset. "
+                        f"Available keys: {sorted(self.datasets_map.keys())}"
+                    )
+                ds_name = canonical
+
+            ds_cls = self.datasets_map[ds_name]
+
+            # Atlas shortcut: "Atlas:small" or "Atlas:one_hop" -> scan disk for all
+            # available graphs of that type and expand to Atlas:small:0, Atlas:small:1, ...
+            if ds_name == "Atlas" and ds_version in ("small", "one_hop"):
+                atlas_dir = os.path.join(root, "atlas", f"splits_{ds_version}")
+                pat = re.compile(rf"^{re.escape(ds_version)}_(\d+)_nodes\.csv$")
+                indices = []
+                if os.path.isdir(atlas_dir):
+                    for fname in sorted(os.listdir(atlas_dir)):
+                        m = pat.match(fname)
+                        if m:
+                            indices.append(int(m.group(1)))
+                if not indices:
+                    raise FileNotFoundError(
+                        f"No Atlas graphs found for type '{ds_version}' in {atlas_dir}"
+                    )
+                for idx in sorted(indices):
+                    expanded_specs.append(f"Atlas:{ds_version}:{idx}")
+                continue
 
             # Auto-expand versions when user didn't specify one.
             versions = getattr(ds_cls, "versions", None)

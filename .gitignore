@@ -170,4 +170,5 @@ runs/
 logs/
 wandb/
 cache/
+config/
 *.tsv

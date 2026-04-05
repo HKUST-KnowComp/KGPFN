@@ -321,15 +321,15 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     logger.warning(f"Number of parameters: {num_params}")
 
     if world_size > 1:
-        parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device])
+        parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
     else:
         parallel_model = model
 
     step = math.ceil(cfg.train.num_epoch / 10)
 
-    # checkpoint 保存相关设置（每次 eval 时保存，由 valid_eval_step_interval 控制）
+    # checkpoint：每个 epoch 结束保存 model_epoch_*.pth；valid 上 eval 仅在有新高时保存 model_best.pth
     checkpoint_dir = getattr(cfg.train, "checkpoint_dir", ".")  # 相对 working_dir 或绝对路径
-    max_checkpoints = int(cfg.train.get("max_checkpoints", 20))  # 最多保留的 step checkpoint 数量（不含 model_best）
+    max_checkpoints = int(cfg.train.get("max_checkpoints", 20))  # 最多保留的 epoch checkpoint 数量（不含 model_best）
     adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
     use_wandb = bool(cfg.train.get("use_wandb", False))
     valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
@@ -416,7 +416,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                 losses.append(loss.item())
                 batch_id += 1
 
-                # 可选：每隔若干个 step 在 valid 上评估一次，每次 eval 后保存 checkpoint
+                # 可选：每隔若干个 step 在 valid 上评估一次；仅当 valid MRR 创新高时保存 model_best.pth
                 if valid_eval_step_interval > 0 and (batch_id % valid_eval_step_interval == 0):
                     if util.get_rank() == 0:
                         logger.warning(separator)
@@ -432,31 +432,18 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                                 },
                                 step=batch_id,
                             )
-                        # 每次 eval 后保存 checkpoint（按 step）
-                        os.makedirs(checkpoint_dir, exist_ok=True)
-                        ckpt_path = os.path.join(checkpoint_dir, f"model_step_{batch_id}.pth")
-                        logger.warning(f"Save checkpoint to {ckpt_path}")
-                        state = {
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "step": batch_id,
-                            "epoch": epoch,
-                            "valid_mrr": float(valid_mrr),
-                        }
-                        torch.save(state, ckpt_path)
-                        # 保留最近 max_checkpoints 个 step checkpoint，删除更早的
-                        step_ckpts = sorted(glob.glob(os.path.join(checkpoint_dir, "model_step_*.pth")), key=lambda p: int(os.path.basename(p).split("_")[-1].replace(".pth", "")))
-                        for old_ckpt in step_ckpts[:-max_checkpoints]:
-                            try:
-                                os.remove(old_ckpt)
-                                logger.warning(f"Remove old checkpoint: {old_ckpt}")
-                            except OSError:
-                                pass
-                        # MRR 最优时额外保存 best
                         valid_mrr_f = float(valid_mrr)
                         if valid_mrr_f > best_mrr:
                             best_mrr = valid_mrr_f
+                            os.makedirs(checkpoint_dir, exist_ok=True)
                             best_path = os.path.join(checkpoint_dir, "model_best.pth")
+                            state = {
+                                "model": model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "step": batch_id,
+                                "epoch": epoch,
+                                "valid_mrr": valid_mrr_f,
+                            }
                             best_state = {**state, "best_mrr": valid_mrr_f}
                             torch.save(best_state, best_path)
                             logger.warning(f"New best MRR {best_mrr:.4f}, save to {best_path}")
@@ -476,6 +463,29 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     },
                     step=batch_id,
                 )
+
+            if util.get_rank() == 0:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                epoch_ckpt_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pth")
+                epoch_state = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": batch_id,
+                    "epoch": epoch,
+                    "best_mrr_so_far": best_mrr,
+                }
+                torch.save(epoch_state, epoch_ckpt_path)
+                logger.warning(f"Save epoch checkpoint to {epoch_ckpt_path}")
+                epoch_ckpts = sorted(
+                    glob.glob(os.path.join(checkpoint_dir, "model_epoch_*.pth")),
+                    key=lambda p: int(os.path.basename(p).split("model_epoch_")[-1].replace(".pth", "")),
+                )
+                for old_ckpt in epoch_ckpts[:-max_checkpoints]:
+                    try:
+                        os.remove(old_ckpt)
+                        logger.warning(f"Remove old epoch checkpoint: {old_ckpt}")
+                    except OSError:
+                        pass
 
         util.synchronize()
 
@@ -753,16 +763,16 @@ if __name__ == "__main__":
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    # train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=filtered_data, batch_per_epoch=cfg.train.batch_per_epoch)
+    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=filtered_data, batch_per_epoch=cfg.train.batch_per_epoch)
     
 
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on valid")
-    # # test(cfg, model, valid_data, filtered_data=filtered_data)
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on test")
-    # test(cfg, model, test_data, filtered_data=filtered_data, split="test")
-    # if util.get_rank() == 0 and use_wandb and wandb is not None:
-    #     wandb.finish()
+    # if util.get_rank() == 0:
+    #     logger.warning(separator)
+    #     logger.warning("Evaluate on valid")
+    # test(cfg, model, valid_data, filtered_data=filtered_data)
+    # if util.get_rank() == 0:
+    #     logger.warning(separator)
+    #     logger.warning("Evaluate on test")
+    test(cfg, model, test_data, filtered_data=filtered_data, split="test")
+    if util.get_rank() == 0 and use_wandb and wandb is not None:
+        wandb.finish()
