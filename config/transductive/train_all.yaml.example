@@ -99,5 +99,5 @@ train:
 
   # wandb logging
   use_wandb: false  # 设为 false 禁用 wandb
-  wandb_api_key: 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
+  wandb_api_key: ""  # set locally; do not commit real keys
   wandb_project: pfn-one
