@@ -17,6 +17,7 @@ class KGPFN(nn.Module):
         semantic_dim: int = 384,
         inverse_relation_semantic_mode: str = "text",
         enhance_structure: bool = False,
+        structure_score_enhance: bool = False,
         seq_chunk_size: Optional[int] = None,
         context_label_correction: bool = False,
     ):
@@ -25,6 +26,8 @@ class KGPFN(nn.Module):
             "至少需要 structure_encoder 或 semantic_encoder 之一"
         assert not (enhance_structure and structure_encoder is None), \
             "enhance_structure=True 需要 structure_encoder"
+        assert not (structure_score_enhance and structure_encoder is None), \
+            "structure_score_enhance=True 需要 structure_encoder"
         self.structure_encoder = structure_encoder
         self.semantic_encoder: Optional[Any] = semantic_encoder
         self.feature_transformer = feature_transformer
@@ -35,6 +38,7 @@ class KGPFN(nn.Module):
         self.semantic_dim = semantic_dim
         self.hidden_dim = entity_dim
         self.enhance_structure = enhance_structure
+        self.structure_score_enhance = structure_score_enhance
         self.seq_chunk_size = seq_chunk_size
         # 是否启用 encoder 软标签修正（缓解 transductive 假负样本）
         self.context_label_correction = context_label_correction
@@ -65,6 +69,15 @@ class KGPFN(nn.Module):
                     nn.Linear(3 * self.hidden_dim, 3 * self.hidden_dim),
                 )
                 self.structure_enhance_norm = nn.LayerNorm(self.hidden_dim)
+
+            # Structure score enhancement: ULTRA MLP score as additional feature
+            if structure_score_enhance:
+                self.structure_score_adapter = nn.Sequential(
+                    nn.Linear(1, self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                self.structure_score_norm = nn.LayerNorm(self.hidden_dim)
 
         # 文本路模块：仅在有 semantic_encoder 时创建
         if semantic_encoder is not None:
@@ -195,11 +208,12 @@ class KGPFN(nn.Module):
     ):
         """
         执行结构路编码，返回 (structure_aligned, context_y)。
-        structure_aligned: [B, S, 3, D] 或 enhance 后的 [B, S, 6, D]
+        structure_aligned: [B, S, 3, D] 或 enhance 后的 [B, S, 6, D] 或 score_enhance 后的 [B, S, 7, D]
         """
         bsz, seq_len, _ = all_id_triples.shape
         h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
 
+        # Label correction (if enabled)
         if self.context_label_correction:
             with torch.no_grad():
                 ctx_scores = self.structure_encoder.get_mlp_scores(
@@ -207,12 +221,21 @@ class KGPFN(nn.Module):
                 )
             context_y = self._apply_label_correction(ctx_scores, context_y)
 
+        # Compute structure scores for all triples (if structure_score_enhance enabled)
+        structure_scores = None
+        if self.structure_score_enhance:
+            with torch.no_grad():
+                # Get MLP scores for all triples: [B, S]
+                structure_scores = self.structure_encoder.get_mlp_scores(t_emb)
+
+        # Apply adapters
         h_emb = self.entity_adapter(h_emb)
         r_emb = self.relation_adapter(r_emb)
         t_emb = self.entity_adapter(t_emb)
         id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
         structure_aligned = self.structure_norm(id_feat)
 
+        # Structure enhancement (TransE, DistMult, Cosine)
         if self.enhance_structure:
             h_s = structure_aligned[:, :, 0, :]
             r_s = structure_aligned[:, :, 1, :]
@@ -230,6 +253,15 @@ class KGPFN(nn.Module):
             )
             enh_delta = self.structure_enhance_norm(enh_delta)
             structure_aligned = torch.cat([structure_aligned, enh_delta], dim=2)
+
+        # Structure score enhancement (ULTRA MLP score as feature)
+        if self.structure_score_enhance:
+            # structure_scores: [B, S] -> [B, S, 1] -> [B, S, D] via adapter
+            score_feat = structure_scores.unsqueeze(-1)  # [B, S, 1]
+            score_feat = self.structure_score_adapter(score_feat)  # [B, S, D]
+            score_feat = self.structure_score_norm(score_feat)  # [B, S, D]
+            score_feat = score_feat.unsqueeze(2)  # [B, S, 1, D]
+            structure_aligned = torch.cat([structure_aligned, score_feat], dim=2)  # [B, S, 3+3+1, D] or [B, S, 3+1, D]
 
         return structure_aligned, context_y
 

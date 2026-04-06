@@ -1,0 +1,176 @@
+22:07:40   Random seed: 0
+22:07:40   Config file: config/transductive/knn.yaml
+22:07:40   CoDExSmall dataset
+22:07:40   #train: 32888, #valid: 1827, #test: 1828
+22:09:41   Random seed: 0
+22:09:41   Config file: config/transductive/knn.yaml
+22:09:41   CoDExSmall dataset
+22:09:41   #train: 32888, #valid: 1827, #test: 1828
+22:09:41   Dataset: CoDExSmall
+22:09:41   Nodes: 2034, Edges: 65776
+22:09:41   Target edges: 32888
+22:09:41   Loading checkpoint from ./ckpts/ultra_50g.pth
+22:09:41   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:09:41   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:09:41   KNN Consistency Test
+22:09:41   KNN Consistency Test
+22:09:41   enhance_structure: False
+22:09:41   enhance_structure: False
+22:09:41   structure_score_enhance: False
+22:09:41   structure_score_enhance: False
+22:09:41   Testing 100 samples with k=10
+22:09:41   Testing 100 samples with k=10
+22:09:41   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:09:41   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:09:41   Actually testing 100 samples
+22:09:41   Actually testing 100 samples
+22:09:41   Processing sample 1/100...
+22:09:41   Processing sample 1/100...
+22:11:33   Random seed: 0
+22:11:33   Config file: config/transductive/knn.yaml
+22:11:33   CoDExSmall dataset
+22:11:33   #train: 32888, #valid: 1827, #test: 1828
+22:11:34   Dataset: CoDExSmall
+22:11:34   Nodes: 2034, Edges: 65776
+22:11:34   Target edges: 32888
+22:11:34   Loading checkpoint from ./ckpts/ultra_50g.pth
+22:11:34   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:11:34   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:11:34   KNN Consistency Test
+22:11:34   KNN Consistency Test
+22:11:34   enhance_structure: False
+22:11:34   enhance_structure: False
+22:11:34   structure_score_enhance: False
+22:11:34   structure_score_enhance: False
+22:11:34   Testing 100 samples with k=10
+22:11:34   Testing 100 samples with k=10
+22:11:34   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:11:34   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:11:34   Actually testing 100 samples
+22:11:34   Actually testing 100 samples
+22:11:34   Processing sample 1/100...
+22:11:34   Processing sample 1/100...
+22:11:40   Processing sample 21/100...
+22:11:40   Processing sample 21/100...
+22:11:47   Processing sample 41/100...
+22:11:47   Processing sample 41/100...
+22:11:53   Processing sample 61/100...
+22:11:53   Processing sample 61/100...
+22:11:59   Processing sample 81/100...
+22:11:59   Processing sample 81/100...
+22:12:00   
+22:12:00   
+22:12:00   ================================================================================
+22:12:00   ================================================================================
+22:12:00   METRIC: COSINE DISTANCE
+22:12:00   METRIC: COSINE DISTANCE
+22:12:00   ================================================================================
+22:12:00   ================================================================================
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   POSITIVE TEST SAMPLES (ground truth triples) - 100 samples:
+22:12:00   POSITIVE TEST SAMPLES (ground truth triples) - 100 samples:
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   Average #positive context: 10.0
+22:12:00   Average #positive context: 10.0
+22:12:00   Average #negative context: 80.0
+22:12:00   Average #negative context: 80.0
+22:12:00   Average distance to positive context: 0.0090
+22:12:00   Average distance to positive context: 0.0090
+22:12:00   Average distance to negative context: 0.0278
+22:12:00   Average distance to negative context: 0.0278
+22:12:00   Distance ratio (pos/neg): 0.3239
+22:12:00   Distance ratio (pos/neg): 0.3239
+22:12:00   Average #positive in top-10: 8.42 / 10
+22:12:00   Average #positive in top-10: 8.42 / 10
+22:12:00   Average #negative closer than farthest positive: 16.44 / 80.0 (20.6%)
+22:12:00   Average #negative closer than farthest positive: 16.44 / 80.0 (20.6%)
+22:12:00   ✓ GOOD: Positive samples are closer to positive context
+22:12:00   ✓ GOOD: Positive samples are closer to positive context
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   NEGATIVE TEST SAMPLES (corrupted triples) - 100 samples:
+22:12:00   NEGATIVE TEST SAMPLES (corrupted triples) - 100 samples:
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   Average distance to positive context: 0.0329
+22:12:00   Average distance to positive context: 0.0329
+22:12:00   Average distance to negative context: 0.0068
+22:12:00   Average distance to negative context: 0.0068
+22:12:00   Distance ratio (neg/pos): 0.2065
+22:12:00   Distance ratio (neg/pos): 0.2065
+22:12:00   Average #negative in top-10: 9.81 / 10
+22:12:00   Average #negative in top-10: 9.81 / 10
+22:12:00   Average #positive closer than nearest negative: 0.00 / 10.0 (0.0%)
+22:12:00   Average #positive closer than nearest negative: 0.00 / 10.0 (0.0%)
+22:12:00   ✓ GOOD: Negative samples are closer to negative context
+22:12:00   ✓ GOOD: Negative samples are closer to negative context
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   SUMMARY (COSINE):
+22:12:00   SUMMARY (COSINE):
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   ✓✓ EXCELLENT: Both positive and negative samples show expected distance patterns
+22:12:00   ✓✓ EXCELLENT: Both positive and negative samples show expected distance patterns
+22:12:00   
+22:12:00   
+22:12:00   ================================================================================
+22:12:00   ================================================================================
+22:12:00   METRIC: EUCLIDEAN DISTANCE
+22:12:00   METRIC: EUCLIDEAN DISTANCE
+22:12:00   ================================================================================
+22:12:00   ================================================================================
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   POSITIVE TEST SAMPLES (ground truth triples) - 100 samples:
+22:12:00   POSITIVE TEST SAMPLES (ground truth triples) - 100 samples:
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   Average #positive context: 10.0
+22:12:00   Average #positive context: 10.0
+22:12:00   Average #negative context: 80.0
+22:12:00   Average #negative context: 80.0
+22:12:00   Average distance to positive context: 2.7112
+22:12:00   Average distance to positive context: 2.7112
+22:12:00   Average distance to negative context: 5.1166
+22:12:00   Average distance to negative context: 5.1166
+22:12:00   Distance ratio (pos/neg): 0.5299
+22:12:00   Distance ratio (pos/neg): 0.5299
+22:12:00   Average #positive in top-10: 8.36 / 10
+22:12:00   Average #positive in top-10: 8.36 / 10
+22:12:00   Average #negative closer than farthest positive: 18.64 / 80.0 (23.3%)
+22:12:00   Average #negative closer than farthest positive: 18.64 / 80.0 (23.3%)
+22:12:00   ✓ GOOD: Positive samples are closer to positive context
+22:12:00   ✓ GOOD: Positive samples are closer to positive context
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   NEGATIVE TEST SAMPLES (corrupted triples) - 100 samples:
+22:12:00   NEGATIVE TEST SAMPLES (corrupted triples) - 100 samples:
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   Average distance to positive context: 5.5475
+22:12:00   Average distance to positive context: 5.5475
+22:12:00   Average distance to negative context: 2.1639
+22:12:00   Average distance to negative context: 2.1639
+22:12:00   Distance ratio (neg/pos): 0.3901
+22:12:00   Distance ratio (neg/pos): 0.3901
+22:12:00   Average #negative in top-10: 9.84 / 10
+22:12:00   Average #negative in top-10: 9.84 / 10
+22:12:00   Average #positive closer than nearest negative: 0.00 / 10.0 (0.0%)
+22:12:00   Average #positive closer than nearest negative: 0.00 / 10.0 (0.0%)
+22:12:00   ✓ GOOD: Negative samples are closer to negative context
+22:12:00   ✓ GOOD: Negative samples are closer to negative context
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   SUMMARY (EUCLIDEAN):
+22:12:00   SUMMARY (EUCLIDEAN):
+22:12:00   ------------------------------
+22:12:00   ------------------------------
+22:12:00   ✓✓ EXCELLENT: Both positive and negative samples show expected distance patterns
+22:12:00   ✓✓ EXCELLENT: Both positive and negative samples show expected distance patterns
+22:12:00   
+22:12:00   
+22:12:00   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+22:12:00   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

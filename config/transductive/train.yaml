@@ -10,6 +10,7 @@ model:
   # 默认 "ultra" 表示启用 StructureEncoderRelationAware
   structure_encoder_name: none
   enhance_structure: False
+  structure_score_enhance: False  # 是否使用 ULTRA MLP score 作为额外特征
   seq_chunk_size: 40  # 序列维度分块，避免 [B,S,num_nodes,D] OOM；null 则不分块
   relation_model:
     class: RelNBFNet

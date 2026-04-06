@@ -223,6 +223,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     inverse_relation_semantic_mode = _resolve_inverse_relation_semantic_mode(cfg)
     train_structure_encoder = bool(cfg.train.get("train_structure_encoder", True))
     enhance_structure = bool(cfg.model.get("enhance_structure", False))
+    structure_score_enhance = bool(cfg.model.get("structure_score_enhance", False))
 
     entity_dim = int(cfg.model.entity_model.get("input_dim", 64))
     relation_dim = int(cfg.model.relation_model.get("input_dim", 64))
@@ -237,6 +238,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         semantic_dim=semantic_dim,
         inverse_relation_semantic_mode=inverse_relation_semantic_mode,
         enhance_structure=enhance_structure,
+        structure_score_enhance=structure_score_enhance,
         seq_chunk_size=seq_chunk_size,
         context_label_correction=context_label_correction,
     )

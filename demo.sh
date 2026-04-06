@@ -25,4 +25,7 @@ python script/run_many.py -c /data/gaoyisen/ultrapfn2/config/transductive/infere
 Test ULTRA model (ultra_50g.pth):                                                                                                                                                                                                                                                                                                            
 CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type ultra --ckpt ./ckpts/ultra_4g.pth --gpus [0]                                                                                                                             
   Test PFN model:                                                                                                                                                                                                                                                                                                            
-CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type pfn --ckpt ./checkpoints/model_best.pth --gpus [0]                           
+CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type pfn --ckpt ./checkpoints/model_best.pth --gpus [0]      
+
+# for knn
+ CUDA_VISIBLE_DEVICES=7 python script/knn.py -c config/transductive/knn.yaml --gpus [0] 
