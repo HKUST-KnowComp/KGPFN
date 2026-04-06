@@ -20,6 +20,7 @@ from torch_geometric.data import Data
 
 try:
     from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
     _ACCELERATE_AVAILABLE = True
 except ImportError:
     _ACCELERATE_AVAILABLE = False
@@ -741,7 +742,10 @@ if __name__ == "__main__":
     if _use_accelerate:
         assert _ACCELERATE_AVAILABLE, "use_accelerate=true but `accelerate` is not installed. Run: pip install accelerate"
         _mixed_precision = cfg.train.get("mixed_precision", "no")
-        accelerator = Accelerator(mixed_precision=_mixed_precision)
+        # find_unused_parameters=True is required because structure_encoder and
+        # semantic_encoder are frozen (requires_grad=False) and produce no gradients.
+        _ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(mixed_precision=_mixed_precision, kwargs_handlers=[_ddp_kwargs])
     else:
         accelerator = None
     # ────────────────────────────────────────────────────────────────────────────

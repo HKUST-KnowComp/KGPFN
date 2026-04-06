@@ -3,7 +3,7 @@ from torch import nn
 
 from pfn import tasks
 from . import layers
-from ultra.base_nbfnet import BaseNBFNet
+from .base_nbfnet import BaseNBFNet
 
 class Ultra(nn.Module):
 

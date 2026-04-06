@@ -349,6 +349,7 @@ class FB15k237Inductive(GrailInductiveDataset):
     ]
 
     name = "IndFB15k237"
+    versions = ["v1", "v2", "v3", "v4"]
 
     def __init__(self, root, **kwargs):
         super().__init__(root, version = kwargs['dataset_version'], **kwargs)
@@ -523,6 +524,7 @@ class WN18RRInductive(GrailInductiveDataset):
     ]
 
     name = "IndWN18RR"
+    versions = ["v1", "v2", "v3", "v4"]
 
     def __init__(self, root, **kwargs):
         super().__init__(root, version = kwargs['dataset_version'], **kwargs)
@@ -536,6 +538,7 @@ class NELLInductive(GrailInductiveDataset):
         "https://raw.githubusercontent.com/kkteru/grail/master/data/nell_%s/valid.txt"
     ]
     name = "IndNELL"
+    versions = ["v1", "v2", "v3", "v4"]
 
     def __init__(self, root, **kwargs):
         super().__init__(root, version = kwargs['dataset_version'], **kwargs)
@@ -2190,6 +2193,7 @@ class FBIngram(IngramInductive):
         "https://raw.githubusercontent.com/bdi-lab/InGram/master/data/FB-%s/test.txt",
     ]
     name = "fb"
+    versions = ["25", "50", "75", "100"]
 
     def process(self):
         
@@ -2329,6 +2333,7 @@ class WKIngram(IngramInductive):
         "https://raw.githubusercontent.com/bdi-lab/InGram/master/data/WK-%s/test.txt",
     ]
     name = "wk"
+    versions = ["25", "50", "75", "100"]
 
     def process(self):
         
@@ -2476,6 +2481,7 @@ class NLIngram(IngramInductive):
         "https://raw.githubusercontent.com/bdi-lab/InGram/master/data/NL-%s/test.txt",
     ]
     name = "nl"
+    versions = ["0", "25", "50", "75", "100"]
 
 class ILPC2022(InductiveDataset):
 
@@ -3375,7 +3381,7 @@ class WikiTopicsMT1(WikiTopics):
 
     name = "WikiTopics-MT1"
     prefix = "wikidata_%sv1"
-    versions = ['mt', 'health', 'tax']
+    versions = ['health', 'tax']  # 注意：没有 'mt' 版本
 
     def __init__(self, **kwargs):
         assert kwargs['dataset_version'] in self.versions, f"unknown version {kwargs['version']}, available: {self.versions}"
@@ -3385,7 +3391,7 @@ class WikiTopicsMT2(WikiTopics):
 
     name = "WikiTopics-MT2"
     prefix = "wikidata_%sv1"
-    versions = ['mt2', 'org', 'sci']
+    versions = ['org', 'sci']  # 注意：没有 'mt2' 版本
 
     def __init__(self, **kwargs):
         super(WikiTopicsMT2, self).__init__(**kwargs)
@@ -3394,7 +3400,7 @@ class WikiTopicsMT3(WikiTopics):
 
     name = "WikiTopics-MT3"
     prefix = "wikidata_%sv2"
-    versions = ['mt3', 'art', 'infra']
+    versions = ['art', 'infra']  # 注意：没有 'mt3' 版本
 
     def __init__(self, **kwargs):
         super(WikiTopicsMT3, self).__init__(**kwargs)
@@ -3403,7 +3409,7 @@ class WikiTopicsMT4(WikiTopics):
 
     name = "WikiTopics-MT4"
     prefix = "wikidata_%sv2"
-    versions = ['mt4', 'sci', 'health']
+    versions = ['sci', 'health']  # 注意：没有 'mt4' 版本
 
     def __init__(self, **kwargs):
         super(WikiTopicsMT4, self).__init__(**kwargs)
@@ -3643,12 +3649,15 @@ class JointDataset(InMemoryDataset):
 
 
     datasets_map = {
-    #     #共16个transductive,使用11个训练(去掉子集)
-        'FB15k237': FB15k237, #包含了fb15k237的子图 FB15k237_10, FB15k237_20, FB15k237_50 共4个
-        # 'WN18RR': WN18RR,
+        # ========== Transductive datasets (16个) ==========
+        'FB15k237': FB15k237,
+        'FB15k237_10': FB15k237_10,  # FB15k237 稀疏子集 (10%)
+        'FB15k237_20': FB15k237_20,  # FB15k237 稀疏子集 (20%)
+        'FB15k237_50': FB15k237_50,  # FB15k237 稀疏子集 (50%)
+        'WN18RR': WN18RR,
         'CoDExSmall': CoDExSmall,
         'CoDExMedium': CoDExMedium,
-        'CoDExLarge': CoDExLarge, #使用codexlarge即可
+        'CoDExLarge': CoDExLarge,
         'NELL995': NELL995,
         'ConceptNet100k': ConceptNet100k,
         'DBpedia100k': DBpedia100k,
@@ -3656,23 +3665,39 @@ class JointDataset(InMemoryDataset):
         'AristoV4': AristoV4,
         'Hetionet': Hetionet,
         'WDsinger': WDsinger,
-        'NELL23k': NELL23k, 
-       # inductive  new nodes no new relations 18个
-       'FB15k237Inductive': FB15k237Inductive,
-       # FB15k237Inductiv(4个),wn18rrinductive(4个),nellinductive(4个)
-       'ILPC2022': ILPC2022, #small ,large 2个
-       'HM': HM, #1k,3k,5k,indigo 4个
-       # inductive  new nodes new relations 共23个  (13个 fb,wn,nl )
-       'WikiTopicsMT1': WikiTopicsMT1, # tax, health 2个
-       'WikiTopicsMT2': WikiTopicsMT2, #org, sci 2个
-       'WikiTopicsMT3': WikiTopicsMT3, #art, infra 2个
-       'WikiTopicsMT4': WikiTopicsMT4, #sci, health 2个
-       'Metafam': Metafam,
-       'FBNELL': FBNELL,
-       # Atlas: individual graphs specified as Atlas:small:0, Atlas:one_hop:0 etc.
-       # Use Atlas:small or Atlas:one_hop to auto-expand all available graphs.
-       'Atlas': Atlas,
+        'NELL23k': NELL23k,
+
+        # ========== Inductive datasets - new nodes, no new relations (18个) ==========
+        # GraIL datasets (12个: 3个基础类 × 4个版本)
+        'FB15k237Inductive': FB15k237Inductive,  # v1, v2, v3, v4 (4个)
+        'WN18RRInductive': WN18RRInductive,      # v1, v2, v3, v4 (4个)
+        'NELLInductive': NELLInductive,          # v1, v2, v3, v4 (4个)
+        # ILPC datasets (2个)
+        'ILPC2022': ILPC2022,                    # small, large (2个)
+        # Hamaguchi datasets (4个)
+        'HM': HM,                                # 1k, 3k, 5k, indigo (4个)
+
+        # ========== Inductive datasets - new nodes, new relations (23个) ==========
+        # Ingram datasets (13个)
+        'NLIngram': NLIngram,                    # 0, 25, 50, 75, 100 (5个)
+        'FBIngram': FBIngram,                    # 25, 50, 75, 100 (4个)
+        'WKIngram': WKIngram,                    # 25, 50, 75, 100 (4个)
+        # MTDEA WikiTopics datasets (8个)
+        'WikiTopicsMT1': WikiTopicsMT1,          # health, tax (2个)
+        'WikiTopicsMT2': WikiTopicsMT2,          # org, sci (2个)
+        'WikiTopicsMT3': WikiTopicsMT3,          # art, infra (2个)
+        'WikiTopicsMT4': WikiTopicsMT4,          # sci, health (2个)
+        # MTDEA other datasets (2个)
+        'Metafam': Metafam,                      # Metafam (1个)
+        'FBNELL': FBNELL,                        # FBNELL_v1 (1个)
+
+        # ========== Atlas datasets (排除在 all 之外) ==========
+        # Atlas: individual graphs specified as Atlas:small:0, Atlas:one_hop:0 etc.
+        # Use Atlas:small or Atlas:one_hop to auto-expand all available graphs.
+        'Atlas': Atlas,
     }
+
+    # 总计: 16 (transductive) + 18 (inductive-no-new-rel) + 23 (inductive-new-rel) = 57个数据集
 
     def __init__(self, root, graphs, transform=None, pre_transform=None):
         # Support:

@@ -2,7 +2,7 @@ output_dir: /data/gaoyisen/pfn/output
 
 dataset:
   class: JointDataset
-  graphs: ["FB15k237Inductive:v1", "FB15k237Inductive:v2"]
+  graphs: all
   # --- graphs 选项说明 ---
   # 仅 all（不含 Atlas）：
   #   graphs: all
@@ -26,7 +26,7 @@ model:
   # 设为 "none" / "null" 可禁用 structure encoder，仅使用 semantic encoder
   # 默认 "ultra" 表示启用 StructureEncoderRelationAware
   structure_encoder_name: ultra
-  enhance_structure: False
+  enhance_structure: True
   seq_chunk_size: 40  # 序列维度分块，避免 [B,S,num_nodes,D] OOM；null 则不分块
   relation_model:
     class: RelNBFNet
@@ -46,7 +46,7 @@ model:
     short_cut: yes
     layer_norm: yes
   semantic_encoder:
-    model_name: all-MiniLM-L12-v2 # none, all-MiniLM-L12-v2, local path
+    model_name: none # none, all-MiniLM-L12-v2, local path
     dim: 384
 
 task:
@@ -70,14 +70,14 @@ optimizer:
 train:
   # train params
   gpus: {{ gpus }}
-  batch_size: 60
-  num_epoch: 0
-  log_interval: 50
-  batch_per_epoch: 400
-  valid_eval_step_interval: 400
+  batch_size: 40
+  num_epoch: 50
+  log_interval: 10
+  batch_per_epoch: 40
+  valid_eval_step_interval: 80
   
   # eval params
-  fast_test: 2
+  fast_test: 50
   eval_chunk_size: 256
 
   use_accelerate: true
@@ -90,7 +90,7 @@ train:
 
   # init model paths
   init_model: true
-  structure_encoder_path: ./ckpts/ultra_3g.pth
+  structure_encoder_path: ./ckpts/ultra_50g.pth
   limix_repo_id: stableai-org/LimiX-16M
   limix_filename: LimiX-16M.ckpt
   limix_cache_dir: ./cache
