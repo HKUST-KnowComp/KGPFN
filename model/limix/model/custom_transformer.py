@@ -18,7 +18,7 @@ class CustomFeaturesTransformer(nn.Module):
                 nhead: int, 
                 embed_dim: int, 
                 hid_dim:int,
-                feature_positional_embedding_type:Literal['none','subortho'] = 'subortho',
+                feature_positional_embedding_type:Literal['none','subortho','absolute','rope'] = 'subortho',
                 mask_prediction: bool = False,
                 features_per_group:int = 2,
                 dropout: float=0,
@@ -71,6 +71,7 @@ class CustomFeaturesTransformer(nn.Module):
             recompute_attn=self.recompute_attn,
             mlp_use_residual=self.mlp_use_residual,
             layer_arch=self.layer_arch, # type: ignore
+            use_rope=(feature_positional_embedding_type == "rope"),
             **layer_kwargs
         )
         # self.x_encoder = nn.Linear(self.structure_encoder_dim, self.embed_dim)
@@ -112,6 +113,12 @@ class CustomFeaturesTransformer(nn.Module):
             self.feature_positional_embedding = nn.Linear(self.embed_dim // 4, self.embed_dim)
         elif feature_positional_embedding_type == "subortho":
             self.feature_positional_embedding = nn.Linear(self.embed_dim // 4, self.embed_dim)
+        elif feature_positional_embedding_type == "absolute":
+            # Learnable embedding for each feature column (max 10 features)
+            self.feature_positional_embedding = nn.Parameter(torch.randn(10, self.embed_dim))
+        elif feature_positional_embedding_type == "rope":
+            # RoPE doesn't need learnable parameters, just store the dimension
+            self.rope_dim = self.embed_dim
         
         self.x_preprocess = preprocesss_4_x(**preprocess_config_x)
 
@@ -291,8 +298,13 @@ class CustomFeaturesTransformer(nn.Module):
                 torch.nn.init.orthogonal_(embs)
             embs =self.feature_positional_embedding(embs.to(x.dtype))
             x += embs[None, None]
-        elif self.feature_positional_embedding_type is None or self.feature_positional_embedding_type == "none":
-            embs = None
+        elif self.feature_positional_embedding_type == "absolute":
+            # Add learnable embedding for each feature column
+            num_features = x.shape[2]
+            embs = self.feature_positional_embedding[:num_features]  # (num_features, embed_dim)
+            x += embs[None, None, :, :]  # Broadcast to (batch, seq, num_features, embed_dim)
+        elif self.feature_positional_embedding_type is None or self.feature_positional_embedding_type == "none" or self.feature_positional_embedding_type == "rope":
+            pass
         else:
             raise ValueError(f"Unknown feature_positional_embedding_type={self.feature_positional_embedding_type}")
         return x

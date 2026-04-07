@@ -22,6 +22,24 @@ from typing_extensions import override
 
 Activation = Literal['gelu']
 
+def apply_rope(x: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE along the second-to-last dimension (position dim).
+    x: (..., F, num_heads, head_dim)
+    """
+    F, H, D = x.shape[-3], x.shape[-2], x.shape[-1]
+    half = D // 2
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, half, dtype=torch.float32, device=x.device) / half))
+    positions = torch.arange(F, dtype=torch.float32, device=x.device)
+    angles = positions[:, None] * inv_freq[None, :]  # (F, half)
+    cos = torch.cos(angles).to(x.dtype)  # (F, half)
+    sin = torch.sin(angles).to(x.dtype)  # (F, half)
+    # Broadcast to (..., F, H, half)
+    cos = cos[:, None, :].expand(*([1] * (x.dim() - 3)), F, H, half)
+    sin = sin[:, None, :].expand(*([1] * (x.dim() - 3)), F, H, half)
+    x1, x2 = x[..., :half], x[..., half:2*half]
+    rotated = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return torch.cat([rotated, x[..., 2*half:]], dim=-1) if D % 2 != 0 else rotated
+
 ACTIVATION_FN: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     'gelu': nn.GELU(), 
     'relu': nn.ReLU(),
@@ -83,7 +101,8 @@ class MultiheadAttention(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         qkv_combined: bool = True,
         dropout:float=0,
-        recompute:bool=False
+        recompute:bool=False,
+        use_rope:bool=False,
     ):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -94,6 +113,7 @@ class MultiheadAttention(torch.nn.Module):
         self.qkv_combined = qkv_combined
         self.dropout = dropout
         self.recompute = recompute
+        self.use_rope = use_rope
         self.device = device
         self.dtype = dtype
 
@@ -318,6 +338,10 @@ class MultiheadAttention(torch.nn.Module):
         # seqlen = None
         if self.qkv_combined:
             qkv = torch.einsum("... s, j h d s -> ... j h d", x, self.qkv_proj_weight)
+            if self.use_rope:
+                q, k, v = qkv.unbind(dim=-3)
+                q, k = apply_rope(q), apply_rope(k)
+                qkv = torch.stack([q, k, v], dim=-3)
         else:
             self.q_proj_weight = self.qkv_proj_weight[0]
             self.kv_proj_weight = self.qkv_proj_weight[1:]
@@ -382,9 +406,10 @@ class EncoderBaseLayer(nn.Module):
                  mlp_use_residual:bool=False,
                  layer_arch: str = 'fmfmsm',
                  seq_attn_isolated: bool = False,
-                 seq_attn_serial: bool = False,  
+                 seq_attn_serial: bool = False,
                  self_share_all_kv_heads: bool = False,
                  cross_share_all_kv_heads: bool = True,
+                 use_rope: bool = False,
                  ):
         super().__init__()
         self.nhead = nhead
@@ -429,7 +454,8 @@ class EncoderBaseLayer(nn.Module):
                                                                 qkv_combined=True,
                                                                 dropout=self.dropout,
                                                                 recompute=self.recompute_attn,
-                                                        ) 
+                                                                use_rope=use_rope,
+                                                        )
                                                         for _ in range(self.feature_attn_num)
                                                     ]
                                                 )
