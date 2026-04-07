@@ -26,4 +26,4 @@ dropout: 0.0
 recompute_attn: false
 mask_prediction: false
 num_thinking_rows: 0 #0
-feature_positional_embedding_type: "rope"  # Options: "none", "subortho", "absolute", "rope"
+feature_positional_embedding_type: "subortho"  # Options: "none", "subortho", "absolute", "rope"

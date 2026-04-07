@@ -348,6 +348,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     checkpoint_dir = getattr(cfg.train, "checkpoint_dir", ".")  # 相对 working_dir 或绝对路径
     max_checkpoints = int(cfg.train.get("max_checkpoints", 20))  # 最多保留的 epoch checkpoint 数量（不含 model_best）
     adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
+    loss_weights = list(cfg.task.get("loss_weights", [1.0, 0.0]))  # [lambda_bce, lambda_softmax]
+    label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
     use_wandb = bool(cfg.train.get("use_wandb", False))
     valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
     best_mrr = -1.0  # 用于保存 MRR 最优的 checkpoint
@@ -413,20 +415,24 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                 )
 
                 # 5) 目标：正样本在 col 0，负样本在 col 1:；loss 加权方式与 pretrain.py 一致
-                target = torch.zeros_like(pred)
-                if target.numel() > 0:
-                    target[:, 0] = 1.0
-                loss_raw = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
-                neg_weight = torch.ones_like(pred)
-                if adversarial_temperature > 0:
-                    with torch.no_grad():
-                        neg_weight[:, 1:] = F.softmax(
-                            pred[:, 1:] / adversarial_temperature, dim=-1
-                        )
-                else:
-                    neg_weight[:, 1:] = 1 / cfg.task.num_negative
-                loss = (loss_raw * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
-                loss = loss.mean()
+                loss = torch.tensor(0.0, device=pred.device)
+                if loss_weights[0] > 0:
+                    target = torch.zeros_like(pred)
+                    if target.numel() > 0:
+                        target[:, 0] = 1.0
+                    loss_raw = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+                    neg_weight = torch.ones_like(pred)
+                    if adversarial_temperature > 0:
+                        with torch.no_grad():
+                            neg_weight[:, 1:] = F.softmax(pred[:, 1:] / adversarial_temperature, dim=-1)
+                    else:
+                        neg_weight[:, 1:] = 1 / cfg.task.num_negative
+                    bce_loss = ((loss_raw * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)).mean()
+                    loss = loss + loss_weights[0] * bce_loss
+                if loss_weights[1] > 0:
+                    sm_target = torch.zeros(pred.size(0), dtype=torch.long, device=pred.device)
+                    softmax_loss = F.cross_entropy(pred, sm_target, label_smoothing=label_smoothing)
+                    loss = loss + loss_weights[1] * softmax_loss
 
                 # accelerate handles gradient scaling for mixed precision automatically
                 if accelerator is not None:
