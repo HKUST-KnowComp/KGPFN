@@ -850,6 +850,8 @@ if __name__ == "__main__":
     # if util.get_rank() == 0:
     #     logger.warning(separator)
     #     logger.warning("Evaluate on test")
+
     test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
+    # test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
     if util.get_rank() == 0 and use_wandb and wandb is not None:
         wandb.finish()

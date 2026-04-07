@@ -475,6 +475,14 @@ class KGPFN(nn.Module):
                 enh_delta = self.structure_enhance_norm(enh_delta)
                 query_structure = torch.cat([query_structure, enh_delta], dim=2)
 
+            if self.structure_score_enhance:
+                with torch.no_grad():
+                    _, _, t_emb_raw = self._triples_to_embeddings(data, query_id)
+                    score_feat = self.structure_encoder.get_mlp_scores(t_emb_raw)
+                score_feat = self.structure_score_adapter(score_feat.unsqueeze(-1))
+                score_feat = self.structure_score_norm(score_feat).unsqueeze(2)
+                query_structure = torch.cat([query_structure, score_feat], dim=2)
+
         # 文本路
         query_text_aligned = None
         if self.semantic_encoder is not None and query_text is not None:
