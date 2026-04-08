@@ -363,6 +363,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                 logger.warning("Epoch %d begin" % epoch)
 
             losses = []
+            bce_losses = []
+            softmax_losses = []
             for _ in range(batch_per_epoch):
                 # Rank 0 samples the graph; broadcast ensures all ranks use the same graph,
                 # eliminating the compute-time divergence that causes DDP timeout.
@@ -416,6 +418,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
 
                 # 5) 目标：正样本在 col 0，负样本在 col 1:；loss 加权方式与 pretrain.py 一致
                 loss = torch.tensor(0.0, device=pred.device)
+                bce_loss = torch.tensor(0.0, device=pred.device)
+                softmax_loss = torch.tensor(0.0, device=pred.device)
                 if loss_weights[0] > 0:
                     target = torch.zeros_like(pred)
                     if target.numel() > 0:
@@ -444,7 +448,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
 
                 if batch_id % cfg.train.log_interval == 0:
                     logger.warning(separator)
-                    logger.warning("binary cross entropy: %g" % loss.item())
+                    logger.warning("total loss: %g, bce_loss: %g, softmax_loss: %g" % (
+                        loss.item(), bce_loss.item(), softmax_loss.item()))
                     if use_wandb and is_main and wandb is not None:
                         wandb.log(
                             {
@@ -455,6 +460,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                             step=batch_id,
                         )
                 losses.append(loss.item())
+                bce_losses.append(bce_loss.item())
+                softmax_losses.append(softmax_loss.item())
                 batch_id += 1
 
                 # 可选：每隔若干个 step 在 valid 上评估一次；仅当 valid MRR 创新高时保存 model_best.pth
@@ -493,14 +500,19 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
 
 
             avg_loss = sum(losses) / len(losses)
+            avg_bce_loss = sum(bce_losses) / len(bce_losses)
+            avg_softmax_loss = sum(softmax_losses) / len(softmax_losses)
             logger.warning(separator)
             logger.warning("Epoch %d end" % epoch)
             logger.warning(line)
-            logger.warning("average binary cross entropy: %g" % avg_loss)
+            logger.warning("average loss: %g, avg_bce_loss: %g, avg_softmax_loss: %g" % (
+                avg_loss, avg_bce_loss, avg_softmax_loss))
             if use_wandb and is_main and wandb is not None:
                 wandb.log(
                     {
                         "train/loss_epoch": avg_loss,
+                        "train/bce_loss_epoch": avg_bce_loss,
+                        "train/softmax_loss_epoch": avg_softmax_loss,
                         "train/metric": avg_loss,
                         "train/epoch": epoch,
                     },
@@ -541,6 +553,9 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
     eval_chunk_size = int(cfg.train.get("eval_chunk_size", 64))
     eval_log_interval = int(cfg.train.get("eval_log_interval", 50))
     score_threshold = float(cfg.train.get("eval_score_threshold", 0.5))
+    loss_weights = list(cfg.task.get("loss_weights", [1.0, 0.0]))
+    adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
+    label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
     
     # test_data is a tuple of validation/test datasets
     # process sequentially
@@ -566,6 +581,7 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
         tp_total = torch.zeros(1, dtype=torch.float32, device=device)
         fp_total = torch.zeros(1, dtype=torch.float32, device=device)
         fn_total = torch.zeros(1, dtype=torch.float32, device=device)
+        eval_losses, eval_bce_losses, eval_softmax_losses = [], [], []
         for batch in test_loader:
             # 1) 严格负采样评测：tail 全候选
             t_batch, _ = tasks.all_negative(test_graph, batch)  # (B, num_nodes, 3)
@@ -608,6 +624,34 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                 )
                 t_score_chunks.append(t_scores_chunk.view(B, -1))
             t_pred = torch.cat(t_score_chunks, dim=1)  # (B, num_nodes)
+
+            # compute loss on full candidate set
+            eval_loss = torch.tensor(0.0, device=t_pred.device)
+            eval_bce_loss = torch.tensor(0.0, device=t_pred.device)
+            eval_softmax_loss = torch.tensor(0.0, device=t_pred.device)
+            if loss_weights[0] > 0:
+                target = torch.zeros_like(t_pred)
+                target.scatter_(1, pos_t_index.unsqueeze(-1), 1.0)
+                loss_raw = F.binary_cross_entropy_with_logits(t_pred, target, reduction="none")
+                neg_weight = t_mask.float()
+                if adversarial_temperature > 0:
+                    with torch.no_grad():
+                        adv_w = F.softmax(t_pred.masked_fill(~t_mask, float('-inf')) / adversarial_temperature, dim=-1)
+                    neg_weight = adv_w * t_mask.float()
+                else:
+                    num_neg = t_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+                    neg_weight = t_mask.float() / num_neg
+                # positive weight = 1
+                weight = neg_weight.clone()
+                weight.scatter_(1, pos_t_index.unsqueeze(-1), 1.0)
+                eval_bce_loss = ((loss_raw * weight).sum(dim=-1) / weight.sum(dim=-1)).mean()
+                eval_loss = eval_loss + loss_weights[0] * eval_bce_loss
+            if loss_weights[1] > 0:
+                eval_softmax_loss = F.cross_entropy(t_pred, pos_t_index.to(t_pred.device), label_smoothing=label_smoothing)
+                eval_loss = eval_loss + loss_weights[1] * eval_softmax_loss
+            eval_losses.append(eval_loss.item())
+            eval_bce_losses.append(eval_bce_loss.item())
+            eval_softmax_losses.append(eval_softmax_loss.item())
 
             # 4) ranking（这里按 tail-only 汇总，契合当前 (h,r,?) 设定）
             t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
@@ -710,6 +754,11 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                     raise ValueError(f"Unknown metric: {metric}")
                 logger.warning("[%s] %s: %g", graph_name, metric, score)
                 graph_metrics[metric] = float(score.item())
+            avg_eval_loss = sum(eval_losses) / len(eval_losses)
+            avg_eval_bce = sum(eval_bce_losses) / len(eval_bce_losses)
+            avg_eval_softmax = sum(eval_softmax_losses) / len(eval_softmax_losses)
+            logger.warning("[%s] loss: %g, bce_loss: %g, softmax_loss: %g",
+                           graph_name, avg_eval_loss, avg_eval_bce, avg_eval_softmax)
         mrr = (1 / all_ranking.float()).mean()
 
         all_metrics.append(mrr)
@@ -857,7 +906,7 @@ if __name__ == "__main__":
     #     logger.warning(separator)
     #     logger.warning("Evaluate on test")
 
-    test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
-    # test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
+    # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
+    test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
     if util.get_rank() == 0 and use_wandb and wandb is not None:
         wandb.finish()

@@ -55,13 +55,13 @@ train:
   # train params
   gpus: {{ gpus }}
   batch_size: 1
-  num_epoch: 50
+  num_epoch: 0
   log_interval: 50
   batch_per_epoch: 400
   valid_eval_step_interval: 400
  
   # eval params
-  fast_test: 400
+  fast_test: 20
   eval_chunk_size: 256
 
   # log params（不配置 log_file 时默认写入 working_dir/pretrain_pfn.log）
