@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from pfn import util, tasks
-from script.run import create_model, test
+from script.run import create_model, test, _build_model_inputs
 
 separator = ">" * 30
 line = "-" * 30
@@ -215,19 +215,23 @@ def compute_loss_stats(cfg, model, graph: Data, split_name: str, seed: int) -> d
     )
 
     # Build context
-    context_x, context_y = tasks.build_context_relation_aware(
+    context_triples, context_labels = tasks.build_context_relation_aware(
         sampled_graph,
         batch_with_neg,
         num_pos=int(cfg.task.num_pos),
         num_neg=int(cfg.task.num_neg),
     )
 
-    # Build query
+    # Prepare inputs
+    query_ids = batch_with_neg.to(device)
+    context_ids = [t.to(device) for t in context_triples]
+    context_y = [t.to(device) for t in context_labels]
+
     use_text = hasattr(model, "semantic_encoder") and model.semantic_encoder is not None
-    query_x, context_x = tasks.build_query_and_context(
+    query_x, context_x = _build_model_inputs(
+        query_ids,
+        context_ids,
         sampled_graph,
-        batch_with_neg,
-        context_x,
         enable_text=use_text,
     )
 
