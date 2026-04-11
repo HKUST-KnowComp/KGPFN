@@ -28,4 +28,7 @@ CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ult
 CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type pfn --ckpt ./checkpoints/model_best.pth --gpus [0]      
 
 # for knn
- CUDA_VISIBLE_DEVICES=4 python script/knn.py -c config/transductive/knn.yaml --gpus [0] 
+ CUDA_VISIBLE_DEVICES=4 python script/knn.py -c config/transductive/knn.yaml --gpus [0]
+
+# for validation checks (context sampling stats + fast eval)
+CUDA_VISIBLE_DEVICES=0 python script/check.py -c config/transductive/check.yaml --gpus [0]
