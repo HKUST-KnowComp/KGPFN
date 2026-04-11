@@ -16,6 +16,15 @@ line = "-" * 30
 
 
 def normalize_graph_splits(dataset):
+    # Check for JointDataset: has .data tuple and .graph_specs
+    if hasattr(dataset, "data") and isinstance(dataset.data, tuple) and len(dataset.data) == 3:
+        train_graphs, valid_graphs, test_graphs = dataset.data
+        names = list(getattr(dataset, "graph_specs", []))
+        if not names:
+            names = [f"graph_{i}" for i in range(len(train_graphs))]
+        return train_graphs, valid_graphs, test_graphs, names
+
+    # Legacy check for _data attribute
     if hasattr(dataset, "_data") and isinstance(dataset._data, list) and len(dataset._data) == 3:
         train_graphs, valid_graphs, test_graphs = dataset._data
         names = list(getattr(dataset, "graph_specs", []))
@@ -23,6 +32,7 @@ def normalize_graph_splits(dataset):
             names = [f"graph_{i}" for i in range(len(train_graphs))]
         return train_graphs, valid_graphs, test_graphs, names
 
+    # Single dataset case
     train_graph, valid_graph, test_graph = dataset[0], dataset[1], dataset[2]
     name = getattr(dataset, "dataset_name", dataset.__class__.__name__)
     version = getattr(dataset, "dataset_version", None)
