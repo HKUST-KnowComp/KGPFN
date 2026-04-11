@@ -214,13 +214,31 @@ def compute_loss_stats(cfg, model, graph: Data, split_name: str, seed: int) -> d
         strict=bool(cfg.task.get("strict_negative", True)),
     )
 
-    # Get model predictions
+    # Build context
+    context_x, context_y = tasks.build_context_relation_aware(
+        sampled_graph,
+        batch_with_neg,
+        num_pos=int(cfg.task.num_pos),
+        num_neg=int(cfg.task.num_neg),
+    )
+
+    # Build query
     use_text = hasattr(model, "semantic_encoder") and model.semantic_encoder is not None
-    if use_text:
-        text_inputs = tasks.build_text_inputs_for_batch(sampled_graph, batch_with_neg)
-        pred = model(sampled_graph, batch_with_neg, all_loss=None, metric=None, text_inputs=text_inputs)
-    else:
-        pred = model(sampled_graph, batch_with_neg, all_loss=None, metric=None)
+    query_x, context_x = tasks.build_query_and_context(
+        sampled_graph,
+        batch_with_neg,
+        context_x,
+        enable_text=use_text,
+    )
+
+    # Get model predictions
+    pred = model(
+        sampled_graph,
+        query_x=query_x,
+        context_x=context_x,
+        context_y=context_y,
+        task_type="reg",
+    )
 
     # Compute softmax loss
     sm_target = torch.zeros(pred.size(0), dtype=torch.long, device=device)
