@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -178,11 +179,10 @@ def collect_context_sampling_stats(cfg, graph: Data, split_name: str, seed: int)
 
 def log_context_stats(logger, dataset_name: str, split_name: str, stats: dict[str, Any], cfg):
     logger.warning(
-        "[%s][%s][context] rows=%d failed=%d pos(mean/min/max)=%.2f/%d/%d neg(mean/min/max)=%.2f/%d/%d zero_pos=%d(%.2f%%) pos_shortfall=%d neg_shortfall=%d total_mismatch=%d",
+        "[%s][%s][context] rows=%d | pos(mean/min/max)=%.2f/%d/%d | neg(mean/min/max)=%.2f/%d/%d | zero_pos=%d(%.2f%%)",
         dataset_name,
         split_name,
         stats["rows_checked"],
-        stats["failed_rows"],
         stats["pos_mean"],
         stats["pos_min"],
         stats["pos_max"],
@@ -191,45 +191,54 @@ def log_context_stats(logger, dataset_name: str, split_name: str, stats: dict[st
         stats["neg_max"],
         stats["zero_pos_rows"],
         stats["zero_pos_ratio"] * 100.0,
-        stats["pos_shortfall_rows"],
-        stats["neg_shortfall_rows"],
-        stats["total_mismatch_rows"],
     )
 
-    warn_zero_pos_ratio_ge = float(cfg.check.context.get("warn_zero_pos_ratio_ge", 1.0))
-    warn_mean_pos_below = float(cfg.check.context.get("warn_mean_pos_below", -1.0))
 
-    if stats["zero_pos_ratio"] >= warn_zero_pos_ratio_ge:
-        logger.warning(
-            "[%s][%s][context] warning: zero-positive ratio %.2f%% >= %.2f%%",
-            dataset_name,
-            split_name,
-            stats["zero_pos_ratio"] * 100.0,
-            warn_zero_pos_ratio_ge * 100.0,
-        )
-    if stats["pos_mean"] < warn_mean_pos_below:
-        logger.warning(
-            "[%s][%s][context] warning: mean positive count %.2f < %.2f",
-            dataset_name,
-            split_name,
-            stats["pos_mean"],
-            warn_mean_pos_below,
-        )
-    if stats["failed_rows"] > 0:
-        logger.warning(
-            "[%s][%s][context] warning: %d rows failed to construct enough negatives",
-            dataset_name,
-            split_name,
-            stats["failed_rows"],
-        )
-    if stats["total_mismatch_rows"] > 0:
-        logger.warning(
-            "[%s][%s][context] warning: %d rows did not preserve expected context size %d",
-            dataset_name,
-            split_name,
-            stats["total_mismatch_rows"],
-            stats["expected_total"],
-        )
+@torch.no_grad()
+def compute_loss_stats(cfg, model, graph: Data, split_name: str, seed: int) -> dict[str, float]:
+    """Compute softmax and BCE loss statistics on a sample of edges."""
+    num_edges = int(cfg.check.fast_eval.get("num_edges", 256))
+    sampled_graph = subsample_graph(graph, num_edges, seed)
+
+    if sampled_graph.target_edge_index.shape[1] == 0:
+        return {"softmax_loss": 0.0, "bce_pos_loss": 0.0, "bce_neg_loss": 0.0}
+
+    device = util.get_device(cfg)
+    triplets = torch.cat([sampled_graph.target_edge_index, sampled_graph.target_edge_type.unsqueeze(0)]).t()
+
+    # Negative sampling
+    batch_with_neg = tasks.negative_sampling_tail(
+        sampled_graph,
+        triplets,
+        num_negative=int(cfg.task.num_negative),
+        strict=bool(cfg.task.get("strict_negative", True)),
+    )
+
+    # Get model predictions
+    use_text = hasattr(model, "semantic_encoder") and model.semantic_encoder is not None
+    if use_text:
+        text_inputs = tasks.build_text_inputs_for_batch(sampled_graph, batch_with_neg)
+        pred = model(sampled_graph, batch_with_neg, all_loss=None, metric=None, text_inputs=text_inputs)
+    else:
+        pred = model(sampled_graph, batch_with_neg, all_loss=None, metric=None)
+
+    # Compute softmax loss
+    sm_target = torch.zeros(pred.size(0), dtype=torch.long, device=device)
+    softmax_loss = F.cross_entropy(pred, sm_target).item()
+
+    # Compute BCE loss
+    pos_loss = F.binary_cross_entropy_with_logits(
+        pred[:, 0], torch.ones(pred.size(0), device=device)
+    ).item()
+    neg_loss = F.binary_cross_entropy_with_logits(
+        pred[:, 1:].reshape(-1), torch.zeros(pred[:, 1:].numel(), device=device)
+    ).item()
+
+    return {
+        "softmax_loss": softmax_loss,
+        "bce_pos_loss": pos_loss,
+        "bce_neg_loss": neg_loss,
+    }
 
 
 @torch.no_grad()
@@ -278,6 +287,17 @@ def run_checks_for_graph(cfg, model, dataset_name: str, train_graph: Data, test_
         logger.warning("[%s][train][fast_eval] %s", dataset_name, train_metrics)
         result["train_eval"] = train_metrics
 
+        # Compute loss statistics
+        train_loss_stats = compute_loss_stats(cfg, model, fast_train_graph, "train", seed)
+        logger.warning(
+            "[%s][train][loss] softmax=%.4f | bce_pos=%.4f | bce_neg=%.4f",
+            dataset_name,
+            train_loss_stats["softmax_loss"],
+            train_loss_stats["bce_pos_loss"],
+            train_loss_stats["bce_neg_loss"],
+        )
+        result["train_loss"] = train_loss_stats
+
     if "test" in enabled_splits:
         test_context_stats = collect_context_sampling_stats(cfg, test_graph, "test", seed + 1)
         log_context_stats(logger, dataset_name, "test", test_context_stats, cfg)
@@ -288,6 +308,17 @@ def run_checks_for_graph(cfg, model, dataset_name: str, train_graph: Data, test_
         test_metrics = fast_evaluate_split(cfg, model, fast_test_graph, test_filtered_graph, "test", logger)
         logger.warning("[%s][test][fast_eval] %s", dataset_name, test_metrics)
         result["test_eval"] = test_metrics
+
+        # Compute loss statistics
+        test_loss_stats = compute_loss_stats(cfg, model, fast_test_graph, "test", seed + 1)
+        logger.warning(
+            "[%s][test][loss] softmax=%.4f | bce_pos=%.4f | bce_neg=%.4f",
+            dataset_name,
+            test_loss_stats["softmax_loss"],
+            test_loss_stats["bce_pos_loss"],
+            test_loss_stats["bce_neg_loss"],
+        )
+        result["test_loss"] = test_loss_stats
 
     return result
 
@@ -300,40 +331,52 @@ def summarize_results(results: list[dict[str, Any]], logger, cfg):
     logger.warning("Final summary")
     logger.warning(line)
 
-    warn_zero_pos_ratio_ge = float(cfg.check.context.get("warn_zero_pos_ratio_ge", 1.0))
-    weak_context = []
     train_mrrs = []
     test_mrrs = []
+    train_softmax_losses = []
+    test_softmax_losses = []
 
     for result in results:
         dataset_name = result["dataset"]
-        train_zero = result.get("train_context", {}).get("zero_pos_ratio", 0.0)
-        test_zero = result.get("test_context", {}).get("zero_pos_ratio", 0.0)
+        train_pos_mean = result.get("train_context", {}).get("pos_mean", 0.0)
+        train_pos_min = result.get("train_context", {}).get("pos_min", 0)
+        test_pos_mean = result.get("test_context", {}).get("pos_mean", 0.0)
+        test_pos_min = result.get("test_context", {}).get("pos_min", 0)
         train_mrr = result.get("train_eval", {}).get("mrr")
         test_mrr = result.get("test_eval", {}).get("mrr")
+        train_softmax = result.get("train_loss", {}).get("softmax_loss")
+        test_softmax = result.get("test_loss", {}).get("softmax_loss")
 
         if train_mrr is not None:
             train_mrrs.append(train_mrr)
         if test_mrr is not None:
             test_mrrs.append(test_mrr)
-        if train_zero >= warn_zero_pos_ratio_ge or test_zero >= warn_zero_pos_ratio_ge:
-            weak_context.append(dataset_name)
+        if train_softmax is not None:
+            train_softmax_losses.append(train_softmax)
+        if test_softmax is not None:
+            test_softmax_losses.append(test_softmax)
 
         logger.warning(
-            "%s | train_zero_pos=%.2f%% | train_mrr=%s | test_zero_pos=%.2f%% | test_mrr=%s",
+            "%s | train_pos(mean/min)=%.2f/%d mrr=%s softmax=%s | test_pos(mean/min)=%.2f/%d mrr=%s softmax=%s",
             dataset_name,
-            train_zero * 100.0,
+            train_pos_mean,
+            train_pos_min,
             f"{train_mrr:.4f}" if train_mrr is not None else "n/a",
-            test_zero * 100.0,
+            f"{train_softmax:.4f}" if train_softmax is not None else "n/a",
+            test_pos_mean,
+            test_pos_min,
             f"{test_mrr:.4f}" if test_mrr is not None else "n/a",
+            f"{test_softmax:.4f}" if test_softmax is not None else "n/a",
         )
 
     if train_mrrs:
         logger.warning("average train mrr: %.4f", sum(train_mrrs) / len(train_mrrs))
     if test_mrrs:
         logger.warning("average test mrr: %.4f", sum(test_mrrs) / len(test_mrrs))
-    if weak_context:
-        logger.warning("datasets with high zero-positive ratio: %s", ", ".join(weak_context))
+    if train_softmax_losses:
+        logger.warning("average train softmax loss: %.4f", sum(train_softmax_losses) / len(train_softmax_losses))
+    if test_softmax_losses:
+        logger.warning("average test softmax loss: %.4f", sum(test_softmax_losses) / len(test_softmax_losses))
 
     logger.warning(separator)
 
