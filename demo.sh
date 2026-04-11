@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 script/run.py \
 
 # for multi-graph pretraining
 CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_3g.yaml --gpus [0]
-CUDA_VISIBLE_DEVICES=4 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
+CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 script/pretrain_pfn.py \
   -c config/transductive/train_all.yaml --gpus [0,1]
@@ -28,4 +28,4 @@ CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ult
 CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type pfn --ckpt ./checkpoints/model_best.pth --gpus [0]      
 
 # for knn
- CUDA_VISIBLE_DEVICES=7 python script/knn.py -c config/transductive/knn.yaml --gpus [0] 
+ CUDA_VISIBLE_DEVICES=4 python script/knn.py -c config/transductive/knn.yaml --gpus [0] 

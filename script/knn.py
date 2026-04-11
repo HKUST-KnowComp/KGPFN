@@ -15,6 +15,43 @@ separator = ">" * 30
 line = "-" * 30
 
 
+def compute_semantic_embeddings(semantic_encoder, data, triples):
+    """
+    使用 semantic encoder 计算三元组的语义 embeddings。
+
+    Args:
+        semantic_encoder: SentenceTransformer
+        data: 图数据，需有 id2entity 和 id2relation
+        triples: [N, 3] 三元组 (h, r, t) indices
+
+    Returns:
+        embeddings: [N, 3*D] 展平的语义特征
+    """
+    id2entity = getattr(data, 'id2entity', None) or getattr(data, 'train_id2entity', {})
+    id2relation = getattr(data, 'id2relation', None) or getattr(data, 'train_id2relation', {})
+
+    texts = []
+    for triple in triples.cpu().tolist():
+        h, r, t = triple
+        h_text = id2entity.get(h, str(h))
+        r_text = id2relation.get(r, str(r))
+        t_text = id2entity.get(t, str(t))
+        texts.extend([h_text, r_text, t_text])
+
+    with torch.no_grad():
+        sem = semantic_encoder.encode(texts, convert_to_tensor=True, show_progress_bar=False)  # [N*3, D]
+
+    N = len(triples)
+    sem = sem.reshape(N, -1)  # [N, 3*D]
+
+    # Check for NaN or inf
+    if torch.isnan(sem).any() or torch.isinf(sem).any():
+        logger = util.get_root_logger()
+        logger.warning(f"WARNING: semantic embeddings contain NaN or inf! texts sample: {texts[:3]}")
+
+    return sem
+
+
 def compute_embeddings(model, data, triples, enhance_structure=False, structure_score_enhance=False):
     """
     计算三元组的 embeddings。
@@ -121,6 +158,11 @@ def analyze_knn(query_feat, context_feats, context_labels, k=5, metric='cosine')
     pos_mask = context_labels == 1
     neg_mask = context_labels == 0
 
+    # Debug: check if pos_mask has any True values
+    if pos_mask.sum() == 0:
+        logger = util.get_root_logger()
+        logger.warning(f"WARNING: No positive samples in context! context_labels unique values: {torch.unique(context_labels)}")
+
     pos_dists = distances[pos_mask]
     neg_dists = distances[neg_mask]
 
@@ -155,7 +197,7 @@ def analyze_knn(query_feat, context_feats, context_labels, k=5, metric='cosine')
     return results
 
 
-def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10):
+def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10, semantic_encoder=None, use_semantic=False):
     """
     测试 KNN 一致性：正样本应该与正样本更近，负样本应该与负样本更近。
     同时测试欧氏距离和余弦距离。
@@ -174,9 +216,20 @@ def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10):
     logger = util.get_root_logger()
     logger.warning(separator)
     logger.warning("KNN Consistency Test")
+    logger.warning(f"mode: {'semantic' if use_semantic else 'structure'}")
     logger.warning(f"enhance_structure: {enhance_structure}")
     logger.warning(f"structure_score_enhance: {structure_score_enhance}")
     logger.warning(f"Testing {num_test_samples} samples with k={k}")
+
+    # Debug: check if id2entity/id2relation exist
+    if use_semantic:
+        id2entity = getattr(data, 'id2entity', None) or getattr(data, 'train_id2entity', {})
+        id2relation = getattr(data, 'id2relation', None) or getattr(data, 'train_id2relation', {})
+        logger.warning(f"id2entity size: {len(id2entity)}, id2relation size: {len(id2relation)}")
+        if len(id2entity) > 0:
+            sample_ent = list(id2entity.items())[:2]
+            logger.warning(f"Sample entities: {sample_ent}")
+
     logger.warning(separator)
 
     # 采样测试三元组
@@ -217,13 +270,28 @@ def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10):
         context_triples = context_triples[0].to(device)  # [M, 3]
         context_labels = context_labels[0].to(device)  # [M]
 
-        # 计算 embeddings
-        test_feat = compute_embeddings(model, data, test_triple, enhance_structure, structure_score_enhance)
-        context_feat = compute_embeddings(model, data, context_triples, enhance_structure, structure_score_enhance)
+        # Skip samples with no positive context
+        num_pos_context = (context_labels == 1).sum().item()
+        if num_pos_context == 0:
+            if i < 5:  # Only log first few
+                logger.warning(f"Sample {i}: No positive context, skipping")
+            continue
 
-        # 展平特征
-        test_feat_flat = flatten_features(test_feat).squeeze(0)  # [D]
-        context_feat_flat = flatten_features(context_feat)  # [M, D]
+        # Debug: print context_labels for first sample
+        if i == 0:
+            logger.warning(f"First sample context_labels: shape={context_labels.shape}, unique={torch.unique(context_labels)}, sum={context_labels.sum()}")
+
+
+        # 计算 embeddings
+        if use_semantic:
+            test_feat_flat = compute_semantic_embeddings(semantic_encoder, data, test_triple)  # [1, D]
+            context_feat_flat = compute_semantic_embeddings(semantic_encoder, data, context_triples)  # [M, D]
+            test_feat_flat = test_feat_flat.squeeze(0)  # [D]
+        else:
+            test_feat = compute_embeddings(model, data, test_triple, enhance_structure, structure_score_enhance)
+            context_feat = compute_embeddings(model, data, context_triples, enhance_structure, structure_score_enhance)
+            test_feat_flat = flatten_features(test_feat).squeeze(0)  # [D]
+            context_feat_flat = flatten_features(context_feat)  # [M, D]
 
         # 分析 KNN - Cosine
         knn_results_cos = analyze_knn(test_feat_flat, context_feat_flat, context_labels, k=k, metric='cosine')
@@ -236,8 +304,11 @@ def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10):
         # 也测试一个负样本
         if len(batch_with_neg[0]) > 1:
             neg_triple = batch_with_neg[0, 1:2, :]  # [1, 3] 第一个负样本
-            neg_feat = compute_embeddings(model, data, neg_triple, enhance_structure, structure_score_enhance)
-            neg_feat_flat = flatten_features(neg_feat).squeeze(0)
+            if use_semantic:
+                neg_feat_flat = compute_semantic_embeddings(semantic_encoder, data, neg_triple).squeeze(0)
+            else:
+                neg_feat = compute_embeddings(model, data, neg_triple, enhance_structure, structure_score_enhance)
+                neg_feat_flat = flatten_features(neg_feat).squeeze(0)
 
             # Cosine
             knn_results_neg_cos = analyze_knn(neg_feat_flat, context_feat_flat, context_labels, k=k, metric='cosine')
@@ -364,21 +435,31 @@ if __name__ == "__main__":
     structure_encoder = _build_structure_encoder(cfg)
 
     if structure_encoder is None:
-        logger.error("structure_encoder is None! Please set structure_encoder_name in config.")
-        sys.exit(1)
+        logger.warning("No structure encoder, will use semantic encoder only")
 
     # 加载 checkpoint
     ckpt_path = cfg.train.get("structure_encoder_path", None)
-    if ckpt_path and os.path.exists(ckpt_path):
-        logger.warning(f"Loading checkpoint from {ckpt_path}")
-        state = torch.load(ckpt_path, map_location="cpu")
-        sd = state["model"] if isinstance(state, dict) and "model" in state else state
-        structure_encoder.load_state_dict(sd, strict=False)
-    else:
-        logger.warning("No checkpoint loaded, using random initialization")
+    if structure_encoder is not None:
+        if ckpt_path and os.path.exists(ckpt_path):
+            logger.warning(f"Loading checkpoint from {ckpt_path}")
+            state = torch.load(ckpt_path, map_location="cpu")
+            sd = state["model"] if isinstance(state, dict) and "model" in state else state
+            structure_encoder.load_state_dict(sd, strict=False)
+        else:
+            logger.warning("No checkpoint loaded, using random initialization")
 
-    structure_encoder = structure_encoder.to(device)
-    structure_encoder.eval()
+        structure_encoder = structure_encoder.to(device)
+        structure_encoder.eval()
+
+    # 加载 semantic encoder
+    use_semantic = bool(cfg.get("knn", {}).get("use_semantic", False))
+    semantic_encoder = None
+    if use_semantic:
+        semantic_encoder = _build_semantic_encoder(cfg)
+        if semantic_encoder is None:
+            logger.error("use_semantic=true but semantic_encoder model_name is none. Set model.semantic_encoder.model_name.")
+            sys.exit(1)
+        logger.warning(f"Semantic encoder loaded: {cfg.model.semantic_encoder.model_name}")
 
     # 运行 KNN 测试
     test_knn_consistency(
@@ -387,4 +468,6 @@ if __name__ == "__main__":
         train_data,
         num_test_samples=100,
         k=10,
+        semantic_encoder=semantic_encoder,
+        use_semantic=use_semantic,
     )
