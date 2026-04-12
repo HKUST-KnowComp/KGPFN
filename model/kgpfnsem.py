@@ -20,6 +20,7 @@ class KGPFN(nn.Module):
         structure_score_enhance: bool = False,
         seq_chunk_size: Optional[int] = None,
         context_label_correction: bool = False,
+        with_relation: bool = True,
     ):
         super().__init__()
         assert structure_encoder is not None or semantic_encoder is not None, \
@@ -42,13 +43,15 @@ class KGPFN(nn.Module):
         self.seq_chunk_size = seq_chunk_size
         # 是否启用 encoder 软标签修正（缓解 transductive 假负样本）
         self.context_label_correction = context_label_correction
+        self.with_relation = with_relation
 
         dropout_rate = getattr(self, 'dropout', 0.0)
 
         # 结构路模块：仅在有 structure_encoder 时创建
         if structure_encoder is not None:
+            entity_input_dim = 2 * self.entity_dim if with_relation else self.entity_dim
             self.entity_adapter = nn.Sequential(
-                nn.Linear(2 * self.entity_dim, self.hidden_dim),
+                nn.Linear(entity_input_dim, self.hidden_dim),
                 nn.Dropout(dropout_rate),
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -88,13 +91,48 @@ class KGPFN(nn.Module):
             )
             self.text_norm = nn.LayerNorm(self.hidden_dim)
 
+    def _triples_to_embeddings_mixed(self, data, triples: torch.Tensor):
+        """
+        Encode [B, S, 3] triples where each row may have mixed relations.
+        Processes each unique relation group separately and reassembles.
+        Returns (h_emb, r_emb, t_emb) each [B, S, D].
+        """
+        bsz, seq_len, _ = triples.shape
+        device = triples.device
+
+        # Collect all (b, s) positions grouped by relation
+        rel_to_positions: dict[int, list[tuple[int, int]]] = {}
+        for b in range(bsz):
+            for s in range(seq_len):
+                r = int(triples[b, s, 2].item())
+                rel_to_positions.setdefault(r, []).append((b, s))
+
+        # First pass to get actual embedding dim from encoder output
+        h_emb_out = r_emb_out = t_emb_out = None
+
+        for r_val, positions in rel_to_positions.items():
+            sub = torch.stack([triples[b, s] for b, s in positions], dim=0).unsqueeze(0)  # [1, P, 3]
+            h_e, t_e, r_e = self.structure_encoder(data, sub, with_relation=self.with_relation)  # each [1, P, D]
+            if h_emb_out is None:
+                D_e = h_e.size(-1)
+                D_r = r_e.size(-1)
+                h_emb_out = torch.zeros(bsz, seq_len, D_e, device=device)
+                r_emb_out = torch.zeros(bsz, seq_len, D_r, device=device)
+                t_emb_out = torch.zeros(bsz, seq_len, D_e, device=device)
+            for idx, (b, s) in enumerate(positions):
+                h_emb_out[b, s] = h_e[0, idx]
+                r_emb_out[b, s] = r_e[0, idx]
+                t_emb_out[b, s] = t_e[0, idx]
+
+        return h_emb_out, r_emb_out, t_emb_out
+
     def _triples_to_embeddings(self, data, all_triples: torch.Tensor):
         """
         调用 structure_encoder.forward，返回 (h_emb, r_emb, t_emb)。
         返回的 t_emb [B, S, feature_dim] 在 adapter 之前，可直接送入
         structure_encoder.get_mlp_scores 计算结构得分。
         """
-        h_emb, t_emb, r_emb = self.structure_encoder(data, all_triples)
+        h_emb, t_emb, r_emb = self.structure_encoder(data, all_triples, with_relation=self.with_relation)
         return h_emb, r_emb, t_emb
 
     def _parse_dual_input(self, query_x, context_x):
@@ -205,19 +243,49 @@ class KGPFN(nn.Module):
         all_id_triples: torch.Tensor,
         num_context: int,
         context_y: List[torch.Tensor],
+        num_meta_context: int = 0,
     ):
         """
         执行结构路编码，返回 (structure_aligned, context_y)。
-        structure_aligned: [B, S, 3, D] 或 enhance 后的 [B, S, 6, D] 或 score_enhance 后的 [B, S, 7, D]
+        num_meta_context: 前 num_meta_context 列为 meta-context（混合 relation），
+                          其余列共享同一 relation。
         """
         bsz, seq_len, _ = all_id_triples.shape
-        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+
+        if num_meta_context > 0:
+            meta_triples = all_id_triples[:, :num_meta_context, :]       # [B, M, 3]
+            rest_triples = all_id_triples[:, num_meta_context:, :]       # [B, S-M, 3]
+            h_meta, r_meta, t_meta = self._triples_to_embeddings_mixed(data, meta_triples)
+            h_rest, t_rest, r_rest = self.structure_encoder(data, rest_triples, with_relation=self.with_relation)
+            h_emb = torch.cat([h_meta, h_rest], dim=1)
+            r_emb = torch.cat([r_meta, r_rest], dim=1)
+            t_emb = torch.cat([t_meta, t_rest], dim=1)
+        else:
+            h_emb, t_emb, r_emb = self._triples_to_embeddings(data, all_id_triples)
+
+        # Label correction / structure_score_enhance 需要 with_relation=True 的 128 维 t_emb
+        # 当 with_relation=False 时，单独获取用于 MLP 的 t_emb
+        need_mlp_t_emb = (self.context_label_correction or self.structure_score_enhance) and not self.with_relation
+        if need_mlp_t_emb:
+            with torch.no_grad():
+                if num_meta_context > 0:
+                    _, t_rest_full, _ = self.structure_encoder(data, rest_triples, with_relation=True)
+                    # meta 部分也需要 128 维，但 meta 是混合 relation，暂用 rest 部分
+                    # label_correction 只用 context 部分，structure_score_enhance 用全部
+                    t_emb_for_mlp = torch.cat([
+                        torch.zeros(bsz, num_meta_context, t_rest_full.size(-1), device=t_rest_full.device),
+                        t_rest_full,
+                    ], dim=1)
+                else:
+                    _, t_emb_for_mlp, _ = self.structure_encoder(data, all_id_triples, with_relation=True)
+        else:
+            t_emb_for_mlp = t_emb
 
         # Label correction (if enabled)
         if self.context_label_correction:
             with torch.no_grad():
                 ctx_scores = self.structure_encoder.get_mlp_scores(
-                    t_emb[:, :num_context]
+                    t_emb_for_mlp[:, :num_context]
                 )
             context_y = self._apply_label_correction(ctx_scores, context_y)
 
@@ -225,8 +293,7 @@ class KGPFN(nn.Module):
         structure_scores = None
         if self.structure_score_enhance:
             with torch.no_grad():
-                # Get MLP scores for all triples: [B, S]
-                structure_scores = self.structure_encoder.get_mlp_scores(t_emb)
+                structure_scores = self.structure_encoder.get_mlp_scores(t_emb_for_mlp)
 
         # Apply adapters
         h_emb = self.entity_adapter(h_emb)
@@ -272,6 +339,7 @@ class KGPFN(nn.Module):
         context_x,
         context_y: List[torch.Tensor],
         task_type: Literal["reg", "cls"] = "cls",
+        num_meta_context: int = 0,
     ) -> torch.Tensor | dict:
         """
         支持双路输入：
@@ -319,7 +387,7 @@ class KGPFN(nn.Module):
         structure_aligned = None
         if self.structure_encoder is not None:
             structure_aligned, context_y = self._build_structure_aligned(
-                data, all_id_triples, num_context, context_y
+                data, all_id_triples, num_context, context_y, num_meta_context=num_meta_context
             )
 
         # 2) 文本路
@@ -374,6 +442,7 @@ class KGPFN(nn.Module):
         context_ids: List[torch.Tensor],
         context_ys: List[torch.Tensor],
         context_texts: Optional[List] = None,
+        num_meta_context: int = 0,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         批量预计算 B 个上下文的 embedding。
@@ -400,7 +469,7 @@ class KGPFN(nn.Module):
         structure_aligned = None
         if self.structure_encoder is not None:
             structure_aligned, context_ys = self._build_structure_aligned(
-                data, all_ctx_ids, M, context_ys
+                data, all_ctx_ids, M, context_ys, num_meta_context=num_meta_context
             )
 
         # 文本路
@@ -477,7 +546,7 @@ class KGPFN(nn.Module):
 
             if self.structure_score_enhance:
                 with torch.no_grad():
-                    _, _, t_emb_raw = self._triples_to_embeddings(data, query_id)
+                    _, t_emb_raw, _ = self.structure_encoder(data, query_id, with_relation=True)
                     score_feat = self.structure_encoder.get_mlp_scores(t_emb_raw)
                 score_feat = self.structure_score_adapter(score_feat.unsqueeze(-1))
                 score_feat = self.structure_score_norm(score_feat).unsqueeze(2)

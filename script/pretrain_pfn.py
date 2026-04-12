@@ -239,6 +239,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     relation_dim = int(cfg.model.relation_model.get("input_dim", 64))
     seq_chunk_size = cfg.model.get("seq_chunk_size", None)
     context_label_correction = bool(cfg.task.get("context_label_correction", False))
+    with_relation = bool(cfg.model.get("with_relation", True))
     model = KGPFN(
         structure_encoder=structure_encoder,
         semantic_encoder=semantic_encoder,
@@ -251,6 +252,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         structure_score_enhance=structure_score_enhance,
         seq_chunk_size=seq_chunk_size,
         context_label_correction=context_label_correction,
+        with_relation=with_relation,
     )
 
     if init:
@@ -398,6 +400,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     batch_with_neg,
                     num_pos=cfg.task.num_pos,
                     num_neg=cfg.task.num_neg,
+                    num_meta_context=int(cfg.task.get("num_meta_context", 0)),
                 )
 
                 # 3) 组织成 KGPFN / PFN 所需的输入格式（可选 text）
@@ -414,6 +417,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     context_x=context_x,
                     context_y=context_y,
                     task_type="reg",
+                    num_meta_context=int(cfg.task.get("num_meta_context", 0)),
                 )
 
                 # 5) 目标：正样本在 col 0，负样本在 col 1:；loss 加权方式与 pretrain.py 一致
@@ -601,13 +605,15 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                 row_anchor_batch,
                 num_pos=cfg.task.num_pos,
                 num_neg=cfg.task.num_neg,
+                num_meta_context=int(cfg.task.get("num_meta_context", 0)),
             )  # 长度为 B
             shared_context_x = [t.to(device) for t in shared_context_x]
             shared_context_y = [y.to(device) for y in shared_context_y]
 
             # 3) 预计算上下文 embedding cache，同时获取（可能修正的）标签
             context_cache, shared_context_y = model.get_context_embeddings_cache(
-                test_graph, shared_context_x, shared_context_y
+                test_graph, shared_context_x, shared_context_y,
+                num_meta_context=int(cfg.task.get("num_meta_context", 0)),
             )
 
             # 4) 分 chunk 评测所有 tail 候选

@@ -135,7 +135,7 @@ def collect_context_sampling_stats(cfg, graph: Data, split_name: str, seed: int)
     num_rows = int(cfg.check.context.get("num_rows", 0))
     batch_size = int(cfg.check.context.get("batch_size", cfg.train.batch_size))
     strict_negative = bool(cfg.check.context.get("strict_negative", cfg.task.get("strict_negative", True)))
-    expected_total = int(cfg.task.num_pos) + int(cfg.task.num_neg)
+    expected_total = int(cfg.task.get("num_meta_context", 0)) + int(cfg.task.num_pos) + int(cfg.task.num_neg)
     stats = _context_stats_dict(expected_total)
 
     sampled_graph = subsample_graph(graph, num_rows, seed)
@@ -158,6 +158,7 @@ def collect_context_sampling_stats(cfg, graph: Data, split_name: str, seed: int)
                 batch_with_neg,
                 num_pos=int(cfg.task.num_pos),
                 num_neg=int(cfg.task.num_neg),
+                num_meta_context=int(cfg.task.get("num_meta_context", 0)),
             )
             for labels in context_labels:
                 _update_context_stats(stats, labels, cfg)
@@ -169,6 +170,7 @@ def collect_context_sampling_stats(cfg, graph: Data, split_name: str, seed: int)
                         row.unsqueeze(0),
                         num_pos=int(cfg.task.num_pos),
                         num_neg=int(cfg.task.num_neg),
+                        num_meta_context=int(cfg.task.get("num_meta_context", 0)),
                     )
                     _update_context_stats(stats, context_labels[0], cfg)
                 except RuntimeError:
@@ -220,6 +222,7 @@ def compute_loss_stats(cfg, model, graph: Data, split_name: str, seed: int) -> d
         batch_with_neg,
         num_pos=int(cfg.task.num_pos),
         num_neg=int(cfg.task.num_neg),
+        num_meta_context=int(cfg.task.get("num_meta_context", 0)),
     )
 
     # Prepare inputs
@@ -242,6 +245,7 @@ def compute_loss_stats(cfg, model, graph: Data, split_name: str, seed: int) -> d
         context_x=context_x,
         context_y=context_y,
         task_type="reg",
+        num_meta_context=int(cfg.task.get("num_meta_context", 0)),
     )
 
     # Compute softmax loss

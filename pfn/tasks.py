@@ -542,19 +542,148 @@ def build_context_for_batch(
 
     return triples_list, labels_list
 
+def _sample_meta_context(
+    edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
+    h_anchor: int,
+    r_anchor: int,
+    num_meta: int,
+    num_nodes: int,
+    forbidden_hrt: set[tuple[int, int, int]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    从 h_anchor 的 k-hop (k=1,2,3) 出射子图中采集 meta-context 三元组。
+    - 任意 relation 均可
+    - 采到的三元组标签为 1
+    - 不足 num_meta 时，用 (h_anchor, random_t, r_anchor) 负样本 (标签 0) 补齐
+
+    Returns:
+        (meta_triples [num_meta, 3], meta_labels [num_meta])
+    """
+    if num_meta <= 0:
+        return (
+            torch.empty((0, 3), dtype=torch.long, device=device),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
+
+    # Build outgoing adjacency: src -> list of (dst, rel) using CPU tensors
+    src_cpu = edge_index[0].cpu()
+    dst_cpu = edge_index[1].cpu()
+    rel_cpu = edge_type.cpu()
+
+    collected: list[tuple[int, int, int]] = []  # (h, t, r)
+    visited_edges: set[tuple[int, int, int]] = set()
+
+    frontier = {h_anchor}
+
+    for _hop in range(3):
+        new_frontier: set[int] = set()
+        for node in frontier:
+            # Find outgoing edges from this node
+            mask = (src_cpu == node)
+            if not mask.any():
+                continue
+            dsts = dst_cpu[mask].tolist()
+            rels = rel_cpu[mask].tolist()
+            for t, r in zip(dsts, rels):
+                tri = (node, t, r)
+                if tri in visited_edges or tri in forbidden_hrt:
+                    continue
+                visited_edges.add(tri)
+                collected.append(tri)
+                new_frontier.add(t)
+        frontier = new_frontier - {h_anchor}
+        if len(collected) >= num_meta:
+            break
+
+    # Sample or keep all collected triples
+    if len(collected) >= num_meta:
+        indices = np.random.choice(len(collected), size=num_meta, replace=False)
+        selected = [collected[idx] for idx in indices]
+        meta_triples = torch.tensor(selected, dtype=torch.long, device=device)
+        meta_labels = torch.ones(num_meta, dtype=torch.long, device=device)
+    else:
+        # All collected are positive
+        num_real = len(collected)
+        num_pad = num_meta - num_real
+
+        if num_real > 0:
+            real_triples = torch.tensor(collected, dtype=torch.long, device=device)
+            real_labels = torch.ones(num_real, dtype=torch.long, device=device)
+        else:
+            real_triples = torch.empty((0, 3), dtype=torch.long, device=device)
+            real_labels = torch.empty(0, dtype=torch.long, device=device)
+
+        # Pad with same-relation negatives (h_anchor, random_t, r_anchor), label=0
+        # Build true pairs for r_anchor to avoid false negatives
+        rel_mask = (edge_type == r_anchor)
+        if rel_mask.any():
+            true_pairs = set(
+                zip(edge_index[0, rel_mask].cpu().tolist(), edge_index[1, rel_mask].cpu().tolist())
+            )
+        else:
+            true_pairs = set()
+
+        pad_triples: list[tuple[int, int, int]] = []
+        pad_set: set[int] = set()
+        tries = 0
+        max_tries = max(1000, num_pad * 50)
+        while len(pad_triples) < num_pad and tries < max_tries:
+            tries += 1
+            t_rand = int(torch.randint(0, num_nodes, (1,)).item())
+            if t_rand in pad_set:
+                continue
+            if (h_anchor, t_rand) in true_pairs:
+                continue
+            tri = (h_anchor, t_rand, r_anchor)
+            if tri in forbidden_hrt or tri in visited_edges:
+                continue
+            pad_triples.append(tri)
+            pad_set.add(t_rand)
+
+        # Deterministic fallback if random wasn't enough
+        if len(pad_triples) < num_pad:
+            for t_cand in torch.randperm(num_nodes).tolist():
+                if len(pad_triples) >= num_pad:
+                    break
+                if t_cand in pad_set or (h_anchor, t_cand) in true_pairs:
+                    continue
+                tri = (h_anchor, t_cand, r_anchor)
+                if tri in forbidden_hrt or tri in visited_edges:
+                    continue
+                pad_triples.append(tri)
+                pad_set.add(t_cand)
+
+        if len(pad_triples) > 0:
+            pad_t = torch.tensor(pad_triples[:num_pad], dtype=torch.long, device=device)
+            pad_l = torch.zeros(pad_t.size(0), dtype=torch.long, device=device)
+        else:
+            pad_t = torch.empty((0, 3), dtype=torch.long, device=device)
+            pad_l = torch.empty(0, dtype=torch.long, device=device)
+
+        meta_triples = torch.cat([real_triples, pad_t], dim=0)
+        meta_labels = torch.cat([real_labels, pad_l], dim=0)
+
+    return meta_triples, meta_labels
+
+
 def build_context_relation_aware(
     data: Data,
     batch: torch.Tensor,
     num_pos: int,
     num_neg: int,
+    num_meta_context: int = 0,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     针对 [B, N, 3] 输入，按每行固定 relation=r 构建并复用上下文：
-      1) 正样本：从全图中采样 relation=r 的真实三元组 (x, y, r)，最多 num_pos 个；
-      2) 若正样本不足 num_pos，缺口自动并入负样本数量；
-      3) 负样本：采样 (x, y, r) 且在图中不存在；
-      4) 去重，且不能包含当前行 [N, 3] 中已有三元组。
+      1) meta-context（可选）：从 head entity 的 k-hop 出射子图采样，标签为 1；
+      2) 正样本：从全图中采样 relation=r 的真实三元组，最多 num_pos 个；
+      3) 若正样本不足 num_pos，缺口自动并入负样本数量；
+      4) 负样本：采样 (x, y, r) 且在图中不存在；
+      5) 去重，且不能包含当前行 [N, 3] 中已有三元组。
 
+    输出每行上下文形状: [num_meta_context + num_pos + num_neg, 3]
     返回长度为 B 的 list，每个 batch 行对应一份上下文。
     """
     assert batch.dim() == 3 and batch.size(-1) == 3, (
@@ -705,7 +834,23 @@ def build_context_relation_aware(
                 "该关系可能接近全连接，无法继续构造不存在的 (x,y,r)。"
             )
 
-        # ===== 3) 打包输出 =====
+        # ===== 3) meta-context：从 head 的 k-hop 出射子图采样 =====
+        if num_meta_context > 0:
+            meta_triples, meta_labels = _sample_meta_context(
+                edge_index=edge_index,
+                edge_type=edge_type,
+                h_anchor=h_anchor,
+                r_anchor=r_anchor,
+                num_meta=num_meta_context,
+                num_nodes=num_nodes,
+                forbidden_hrt=forbidden_row_hrt,
+                device=device,
+            )
+        else:
+            meta_triples = torch.empty((0, 3), dtype=torch.long, device=device)
+            meta_labels = torch.empty(0, dtype=torch.long, device=device)
+
+        # ===== 4) 打包输出 =====
         # 如果没有正样本，只使用负样本
         if actual_pos > 0:
             pos_raw = torch.tensor(pos_candidates, dtype=torch.long, device=device)
@@ -720,8 +865,8 @@ def build_context_relation_aware(
         neg_triples = neg_raw.view(neg_raw.numel() // 3, 3)
         neg_labels = torch.zeros(neg_triples.size(0), dtype=torch.long, device=device)
 
-        row_triples = torch.cat([pos_triples, neg_triples], dim=0)
-        row_labels = torch.cat([pos_labels, neg_labels], dim=0)
+        row_triples = torch.cat([meta_triples, pos_triples, neg_triples], dim=0)
+        row_labels = torch.cat([meta_labels, pos_labels, neg_labels], dim=0)
 
         triples_list.append(row_triples)
         labels_list.append(row_labels)

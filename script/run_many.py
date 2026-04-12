@@ -80,12 +80,14 @@ def test_single_graph(cfg, model, test_graph, filtered_data, logger, dataset_nam
                 row_anchor_batch,
                 num_pos=cfg.task.num_pos,
                 num_neg=cfg.task.num_neg,
+                num_meta_context=int(cfg.task.get("num_meta_context", 0)),
             )
             shared_context_x = [t.to(device) for t in shared_context_x]
             shared_context_y = [y.to(device) for y in shared_context_y]
 
             context_cache, shared_context_y = model.get_context_embeddings_cache(
-                test_graph, shared_context_x, shared_context_y
+                test_graph, shared_context_x, shared_context_y,
+                num_meta_context=int(cfg.task.get("num_meta_context", 0)),
             )
 
             # Chunk evaluation

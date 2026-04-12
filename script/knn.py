@@ -265,6 +265,7 @@ def test_knn_consistency(cfg, model, data, num_test_samples=100, k=10, semantic_
             batch_with_neg,
             num_pos=cfg.task.num_pos,
             num_neg=cfg.task.num_neg,
+            num_meta_context=int(cfg.task.get("num_meta_context", 0)),
         )
 
         context_triples = context_triples[0].to(device)  # [M, 3]

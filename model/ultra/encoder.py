@@ -65,7 +65,7 @@ class StructureEncoderRelationAware(nn.Module):
         self.entity_model = globals()[entity_model_cfg.pop('class')](**entity_model_cfg)
         self.entity_chunk_size = entity_chunk_size
 
-    def get_representations(self, data, batch):
+    def get_representations(self, data, batch, with_relation=True):
         """
         relation-aware 结构编码：
           - 输入 batch 形状 [B, S, 3]（每行共享同一 relation）；
@@ -143,7 +143,7 @@ class StructureEncoderRelationAware(nn.Module):
             self.entity_model.query = rel_chunk
             for layer in self.entity_model.layers:
                 layer.relation = rel_chunk
-            out = self.entity_model.bellmanford(data, h_chunk, r_chunk)
+            out = self.entity_model.bellmanford(data, h_chunk, r_chunk, with_relation=with_relation)
             feat = out["node_feature"]  # [chunk, num_nodes, D]
             del out
 
@@ -167,8 +167,8 @@ class StructureEncoderRelationAware(nn.Module):
         return relation_representations, h_embs, t_embs
 
 
-    def forward(self, data, batch):
-        relation_representations, h_embed, t_embed = self.get_representations(data, batch)
+    def forward(self, data, batch, with_relation=True):
+        relation_representations, h_embed, t_embed = self.get_representations(data, batch, with_relation=with_relation)
         # h_embed, t_embed: [B, S, D]
         # relation_representations: [B, R, D]
 
@@ -299,8 +299,8 @@ class EntityNBFNet(BaseNBFNet):
         mlp.append(nn.Linear(feature_dim, 1))
         self.mlp = nn.Sequential(*mlp)
 
-    
-    def bellmanford(self, data, h_index, r_index, separate_grad=False):
+
+    def bellmanford(self, data, h_index, r_index, separate_grad=False, with_relation=True):
         batch_size = len(r_index)
 
         # initialize queries (relation types of the given triples)
@@ -311,7 +311,7 @@ class EntityNBFNet(BaseNBFNet):
         boundary = torch.zeros(batch_size, data.num_nodes, self.dims[0], device=h_index.device)
         # by the scatter operation we put query (relation) embeddings as init features of source (index) nodes
         boundary.scatter_add_(1, index.unsqueeze(1), query.unsqueeze(1))
-        
+
         size = (data.num_nodes, data.num_nodes)
         edge_weight = torch.ones(data.num_edges, device=h_index.device)
 
@@ -333,17 +333,20 @@ class EntityNBFNet(BaseNBFNet):
             hiddens.append(hidden)
             edge_weights.append(edge_weight)
             layer_input = hidden
-        # if self.concat_hidden:
-        #     output = hiddens
-        # else:
-        #     output = hiddens[-1]
-        # return output
-        # original query (relation type) embeddings
-        node_query = query.unsqueeze(1).expand(-1, data.num_nodes, -1) # (batch_size, num_nodes, input_dim)
-        if self.concat_hidden:
-            output = torch.cat(hiddens + [node_query], dim=-1)
+
+        if with_relation:
+            # original query (relation type) embeddings
+            node_query = query.unsqueeze(1).expand(-1, data.num_nodes, -1) # (batch_size, num_nodes, input_dim)
+            if self.concat_hidden:
+                output = torch.cat(hiddens + [node_query], dim=-1)
+            else:
+                output = torch.cat([hiddens[-1], node_query], dim=-1)
         else:
-            output = torch.cat([hiddens[-1], node_query], dim=-1)
+            # structure-only: no relation embedding appended
+            if self.concat_hidden:
+                output = torch.cat(hiddens, dim=-1)
+            else:
+                output = hiddens[-1]
 
         return {
             "node_feature": output,

@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 script/run.py \
 
 # for multi-graph pretraining
 CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_3g.yaml --gpus [0]
-CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
+CUDA_VISIBLE_DEVICES=4 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 script/pretrain_pfn.py \
   -c config/transductive/train_all.yaml --gpus [0,1]
