@@ -3827,3 +3827,326 @@ class JointDataset(InMemoryDataset):
         # ]
 
         torch.save((train_data, valid_data, test_data), self.processed_paths[0])
+
+
+class MultiModalKGDataset(InMemoryDataset):
+    """Base class for multimodal knowledge graph datasets with images and numerical attributes."""
+
+    def __init__(self, root, dataset_name, transform=None, pre_transform=build_relation_graph, **kwargs):
+        self.dataset_name = dataset_name
+        self.dataset_version = kwargs.get('dataset_version', None)
+        self.mmkb_root = "/data/gaoyisen/mmkb"
+        super().__init__(root, transform, pre_transform)
+        # Load the full data structure
+        self.full_data = torch.load(self.processed_paths[0], weights_only=False)
+        # For compatibility with InMemoryDataset, we need data and slices
+        # But we store the actual data differently
+        self.data = None
+        self.slices = None
+
+    @property
+    def raw_dir(self):
+        return os.path.join(self.root, self.dataset_name.lower(), "raw")
+
+    @property
+    def processed_dir(self):
+        return os.path.join(self.root, self.dataset_name.lower(), "processed")
+
+    @property
+    def raw_file_names(self):
+        return ["entity_triples.txt", "image_index.txt", "numerical_triples.txt"]
+
+    @property
+    def processed_file_names(self):
+        return "data.pt"
+
+    def download(self):
+        # Data already exists in mmkb_root, just create symlinks
+        os.makedirs(self.raw_dir, exist_ok=True)
+
+    def load_entity_triples(self, file_path):
+        """Load entity triples from file."""
+        triplets = []
+        inv_entity_vocab = {}
+        inv_rel_vocab = {}
+        entity_cnt, rel_cnt = 0, 0
+
+        with open(file_path, "r", encoding="utf-8") as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Handle both RDF format and tab-separated format
+                if line.endswith(" ."):
+                    parts = line[:-2].split()
+                    if len(parts) >= 3:
+                        h, r, t = parts[0], parts[1], parts[2]
+                    else:
+                        continue
+                else:
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        h, r, t = parts[0], parts[1], parts[2]
+                    else:
+                        continue
+
+                if h not in inv_entity_vocab:
+                    inv_entity_vocab[h] = entity_cnt
+                    entity_cnt += 1
+                if t not in inv_entity_vocab:
+                    inv_entity_vocab[t] = entity_cnt
+                    entity_cnt += 1
+                if r not in inv_rel_vocab:
+                    inv_rel_vocab[r] = rel_cnt
+                    rel_cnt += 1
+
+                h_id = inv_entity_vocab[h]
+                t_id = inv_entity_vocab[t]
+                r_id = inv_rel_vocab[r]
+                triplets.append((h_id, t_id, r_id))
+
+        return triplets, inv_entity_vocab, inv_rel_vocab
+
+    def load_image_index(self, file_path, inv_entity_vocab):
+        """Load image index mapping entities to image IDs."""
+        entity_to_image = {}
+
+        with open(file_path, "r", encoding="utf-8") as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    entity, img_id = parts[0], parts[1]
+                    if entity in inv_entity_vocab:
+                        entity_to_image[inv_entity_vocab[entity]] = img_id
+
+        return entity_to_image
+
+    def load_numerical_triples(self, file_path, inv_entity_vocab, inv_rel_vocab):
+        """Load numerical attribute triples."""
+        numerical_data = []
+
+        with open(file_path, "r", encoding="utf-8") as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Parse RDF format with typed literals
+                if line.endswith(" ."):
+                    parts = line[:-2].split()
+                    if len(parts) >= 3:
+                        entity, relation = parts[0], parts[1]
+                        # Extract value from typed literal
+                        value_str = parts[2]
+                        if "^^" in value_str:
+                            value_str = value_str.split("^^")[0].strip('"')
+                        else:
+                            value_str = value_str.strip('"')
+                        try:
+                            value = float(value_str)
+                            # Check if entity and relation exist in vocab
+                            if entity in inv_entity_vocab:
+                                # For numerical relations, we may not have them in relation vocab yet
+                                if relation not in inv_rel_vocab:
+                                    inv_rel_vocab[relation] = len(inv_rel_vocab)
+                                numerical_data.append({
+                                    'entity': inv_entity_vocab[entity],
+                                    'relation': inv_rel_vocab[relation],
+                                    'value': value
+                                })
+                        except ValueError:
+                            continue
+                else:
+                    # Try tab-separated format
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        entity, relation, value_str = parts[0], parts[1], parts[2]
+                        try:
+                            value = float(value_str)
+                            if entity in inv_entity_vocab:
+                                if relation not in inv_rel_vocab:
+                                    inv_rel_vocab[relation] = len(inv_rel_vocab)
+                                numerical_data.append({
+                                    'entity': inv_entity_vocab[entity],
+                                    'relation': inv_rel_vocab[relation],
+                                    'value': value
+                                })
+                        except ValueError:
+                            continue
+
+        return numerical_data
+
+    def process(self):
+        # Load entity triples
+        entity_file = os.path.join(self.mmkb_root, self.dataset_name,
+                                   f"{self.dataset_name}_EntityTriples.txt")
+        triplets, inv_entity_vocab, inv_rel_vocab = self.load_entity_triples(entity_file)
+
+        # Load image index
+        image_file = os.path.join(self.mmkb_root, self.dataset_name,
+                                 f"{self.dataset_name}_ImageIndex.txt")
+        entity_to_image = self.load_image_index(image_file, inv_entity_vocab)
+
+        # Load numerical triples
+        numerical_file = os.path.join(self.mmkb_root, self.dataset_name,
+                                     f"{self.dataset_name}_NumericalTriples.txt")
+        numerical_data = self.load_numerical_triples(numerical_file, inv_entity_vocab, inv_rel_vocab)
+
+        # Split into train/valid/test (80/10/10)
+        num_triplets = len(triplets)
+        train_size = int(0.8 * num_triplets)
+        valid_size = int(0.1 * num_triplets)
+
+        train_triplets = triplets[:train_size]
+        valid_triplets = triplets[train_size:train_size + valid_size]
+        test_triplets = triplets[train_size + valid_size:]
+
+        num_node = len(inv_entity_vocab)
+        num_relations = len(inv_rel_vocab)
+
+        # Create train graph
+        train_target_edges = torch.tensor([[t[0], t[1]] for t in train_triplets], dtype=torch.long).t()
+        train_target_etypes = torch.tensor([t[2] for t in train_triplets])
+        train_edges = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
+        train_etypes = torch.cat([train_target_etypes, train_target_etypes + num_relations])
+
+        # Create valid/test graphs
+        valid_edges = torch.tensor([[t[0], t[1]] for t in valid_triplets], dtype=torch.long).t()
+        valid_etypes = torch.tensor([t[2] for t in valid_triplets])
+
+        test_edges = torch.tensor([[t[0], t[1]] for t in test_triplets], dtype=torch.long).t()
+        test_etypes = torch.tensor([t[2] for t in test_triplets])
+
+        train_data = Data(
+            edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+            target_edge_index=train_target_edges, target_edge_type=train_target_etypes,
+            num_relations=num_relations * 2
+        )
+        valid_data = Data(
+            edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+            target_edge_index=valid_edges, target_edge_type=valid_etypes,
+            num_relations=num_relations * 2
+        )
+        test_data = Data(
+            edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+            target_edge_index=test_edges, target_edge_type=test_etypes,
+            num_relations=num_relations * 2
+        )
+
+        # Store metadata
+        metadata = {
+            'inv_entity_vocab': inv_entity_vocab,
+            'inv_rel_vocab': inv_rel_vocab,
+            'entity_to_image': entity_to_image,
+            'numerical_data': numerical_data,
+            'image_h5_path': os.path.join(self.mmkb_root, self.dataset_name,
+                                         f"{self.dataset_name}_ImageData.h5")
+        }
+
+        if self.pre_transform is not None:
+            train_data = self.pre_transform(train_data)
+            valid_data = self.pre_transform(valid_data)
+            test_data = self.pre_transform(test_data)
+
+        torch.save(([train_data], [valid_data], [test_data], metadata), self.processed_paths[0])
+
+    def get(self, idx):
+        """Get train/valid/test split by index."""
+        return self.full_data[idx]
+
+    def __getitem__(self, idx):
+        """Get train/valid/test split by index."""
+        return self.full_data[idx]
+
+    def load_image_embeddings(self, entity_ids=None):
+        """Load image embeddings for specified entities."""
+        import h5py
+
+        metadata = self.full_data[3]
+        entity_to_image = metadata['entity_to_image']
+        h5_path = metadata['image_h5_path']
+
+        embeddings = {}
+        with h5py.File(h5_path, 'r') as f:
+            if entity_ids is None:
+                entity_ids = list(entity_to_image.keys())
+
+            for ent_id in entity_ids:
+                if ent_id in entity_to_image:
+                    img_id = entity_to_image[ent_id]
+                    if img_id in f:
+                        embeddings[ent_id] = torch.tensor(f[img_id][:])
+
+        return embeddings
+
+    def get_numerical_attributes(self):
+        """Get all numerical attributes."""
+        return self.full_data[3]['numerical_data']
+
+    def get_metadata(self):
+        """Get dataset metadata."""
+        return self.full_data[3]
+
+
+class DB15KMM(MultiModalKGDataset):
+    """DB15K multimodal dataset."""
+    def __init__(self, root, transform=None, pre_transform=build_relation_graph, **kwargs):
+        super().__init__(root, 'DB15K', transform, pre_transform, **kwargs)
+
+
+class FB15KMM(MultiModalKGDataset):
+    """FB15K multimodal dataset."""
+    def __init__(self, root, transform=None, pre_transform=build_relation_graph, **kwargs):
+        super().__init__(root, 'FB15K', transform, pre_transform, **kwargs)
+        # Load FB mid to name mapping
+        self.mid2name = self._load_fb_mid2name()
+
+    def _load_fb_mid2name(self):
+        """Load Freebase MID to name mapping."""
+        mid2name = {}
+        mapping_file = "/data/gaoyisen/pfn/fb_mid2name.tsv"
+
+        if not os.path.exists(mapping_file):
+            print(f"Warning: FB mid2name file not found at {mapping_file}")
+            return mid2name
+
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        mid, name = parts[0], parts[1]
+                        mid2name[mid] = name
+            print(f"Loaded {len(mid2name)} FB MID to name mappings")
+        except Exception as e:
+            print(f"Warning: Failed to load FB mid2name: {e}")
+
+        return mid2name
+
+    def get_entity_name(self, entity_id_or_mid):
+        """Get human-readable name for an entity ID or MID."""
+        # If it's an integer, get the MID from vocab first
+        if isinstance(entity_id_or_mid, int):
+            metadata = self.get_metadata()
+            entity_vocab = {v: k for k, v in metadata['inv_entity_vocab'].items()}
+            mid = entity_vocab.get(entity_id_or_mid, None)
+            if mid is None:
+                return f"Entity_{entity_id_or_mid}"
+        else:
+            mid = entity_id_or_mid
+
+        # Look up the name
+        return self.mid2name.get(mid, mid)
+
+
+class YAGO15KMM(MultiModalKGDataset):
+    """YAGO15K multimodal dataset."""
+    def __init__(self, root, transform=None, pre_transform=build_relation_graph, **kwargs):
+        super().__init__(root, 'YAGO15K', transform, pre_transform, **kwargs)
