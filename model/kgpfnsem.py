@@ -261,8 +261,7 @@ class KGPFN(nn.Module):
             r_emb = torch.cat([r_meta, r_rest], dim=1)
             t_emb = torch.cat([t_meta, t_rest], dim=1)
         else:
-            h_emb, t_emb, r_emb = self._triples_to_embeddings(data, all_id_triples)
-
+            h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
         # Label correction / structure_score_enhance 需要 with_relation=True 的 128 维 t_emb
         # 当 with_relation=False 时，单独获取用于 MLP 的 t_emb
         need_mlp_t_emb = (self.context_label_correction or self.structure_score_enhance) and not self.with_relation
