@@ -21,6 +21,7 @@ class KGPFN(nn.Module):
         seq_chunk_size: Optional[int] = None,
         context_label_correction: bool = False,
         with_relation: bool = True,
+        context_graph: int = 0,
     ):
         super().__init__()
         assert structure_encoder is not None or semantic_encoder is not None, \
@@ -44,6 +45,7 @@ class KGPFN(nn.Module):
         # 是否启用 encoder 软标签修正（缓解 transductive 假负样本）
         self.context_label_correction = context_label_correction
         self.with_relation = with_relation
+        self.context_graph = context_graph
 
         dropout_rate = getattr(self, 'dropout', 0.0)
 
@@ -63,6 +65,18 @@ class KGPFN(nn.Module):
                 nn.Linear(self.hidden_dim, self.hidden_dim),
             )
             self.structure_norm = nn.LayerNorm(self.hidden_dim)
+
+            # context_graph adapter: maps k * entity_dim -> hidden_dim per hop
+            if context_graph > 0:
+                # input dim: entity NBFNet hidden at layer k is entity_dim (no relation concat since we use raw hidden)
+                cg_in_dim = entity_dim  # each hop produces entity_dim features
+                self.context_graph_adapter = nn.Sequential(
+                    nn.Linear(cg_in_dim, self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                self.context_graph_norm = nn.LayerNorm(self.hidden_dim)
+
             # Triple-level structure enhancement adapter.
             # Input: [TransE(h+r-t), DistMult(h*r*t), cos(h+r,t)] -> 3*D
             if enhance_structure:
@@ -243,40 +257,21 @@ class KGPFN(nn.Module):
         all_id_triples: torch.Tensor,
         num_context: int,
         context_y: List[torch.Tensor],
-        num_meta_context: int = 0,
     ):
         """
         执行结构路编码，返回 (structure_aligned, context_y)。
-        num_meta_context: 前 num_meta_context 列为 meta-context（混合 relation），
-                          其余列共享同一 relation。
+        当 context_graph > 0 时，对每个三元组额外提取 1..k hop 的头实体 embedding，
+        经 adapter 后拼接到序列最前面（每个 hop 作为一个额外 token）。
         """
         bsz, seq_len, _ = all_id_triples.shape
 
-        if num_meta_context > 0:
-            meta_triples = all_id_triples[:, :num_meta_context, :]       # [B, M, 3]
-            rest_triples = all_id_triples[:, num_meta_context:, :]       # [B, S-M, 3]
-            h_meta, r_meta, t_meta = self._triples_to_embeddings_mixed(data, meta_triples)
-            h_rest, t_rest, r_rest = self.structure_encoder(data, rest_triples, with_relation=self.with_relation)
-            h_emb = torch.cat([h_meta, h_rest], dim=1)
-            r_emb = torch.cat([r_meta, r_rest], dim=1)
-            t_emb = torch.cat([t_meta, t_rest], dim=1)
-        else:
-            h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+
         # Label correction / structure_score_enhance 需要 with_relation=True 的 128 维 t_emb
-        # 当 with_relation=False 时，单独获取用于 MLP 的 t_emb
         need_mlp_t_emb = (self.context_label_correction or self.structure_score_enhance) and not self.with_relation
         if need_mlp_t_emb:
             with torch.no_grad():
-                if num_meta_context > 0:
-                    _, t_rest_full, _ = self.structure_encoder(data, rest_triples, with_relation=True)
-                    # meta 部分也需要 128 维，但 meta 是混合 relation，暂用 rest 部分
-                    # label_correction 只用 context 部分，structure_score_enhance 用全部
-                    t_emb_for_mlp = torch.cat([
-                        torch.zeros(bsz, num_meta_context, t_rest_full.size(-1), device=t_rest_full.device),
-                        t_rest_full,
-                    ], dim=1)
-                else:
-                    _, t_emb_for_mlp, _ = self.structure_encoder(data, all_id_triples, with_relation=True)
+                _, t_emb_for_mlp, _ = self.structure_encoder(data, all_id_triples, with_relation=True)
         else:
             t_emb_for_mlp = t_emb
 
@@ -329,6 +324,19 @@ class KGPFN(nn.Module):
             score_feat = score_feat.unsqueeze(2)  # [B, S, 1, D]
             structure_aligned = torch.cat([structure_aligned, score_feat], dim=2)  # [B, S, 3+3+1, D] or [B, S, 3+1, D]
 
+        # context_graph: extract k-hop head embeddings and prepend as extra tokens
+        if self.context_graph > 0:
+            # For each hop k=1..context_graph, get head emb at layer k: [B, S, D_raw]
+            # Then project to hidden_dim and stack as [B, S, context_graph, D]
+            hop_feats = []
+            for k in range(1, self.context_graph + 1):
+                h_k = self.structure_encoder.get_layer_output(data, all_id_triples, layer_k=k, with_relation=False)  # [B, S, D_raw]
+                h_k = self.context_graph_norm(self.context_graph_adapter(h_k))  # [B, S, D]
+                hop_feats.append(h_k.unsqueeze(2))  # [B, S, 1, D]
+            cg_feat = torch.cat(hop_feats, dim=2)  # [B, S, context_graph, D]
+            # Prepend context_graph tokens before the structure tokens
+            structure_aligned = torch.cat([cg_feat, structure_aligned], dim=2)  # [B, S, context_graph+..., D]
+            
         return structure_aligned, context_y
 
     def forward(
@@ -338,7 +346,6 @@ class KGPFN(nn.Module):
         context_x,
         context_y: List[torch.Tensor],
         task_type: Literal["reg", "cls"] = "cls",
-        num_meta_context: int = 0,
     ) -> torch.Tensor | dict:
         """
         支持双路输入：
@@ -386,7 +393,7 @@ class KGPFN(nn.Module):
         structure_aligned = None
         if self.structure_encoder is not None:
             structure_aligned, context_y = self._build_structure_aligned(
-                data, all_id_triples, num_context, context_y, num_meta_context=num_meta_context
+                data, all_id_triples, num_context, context_y
             )
 
         # 2) 文本路
@@ -421,7 +428,6 @@ class KGPFN(nn.Module):
             dim=0,
         )
         eval_pos = num_context
-
         out = self.feature_transformer(fused_x, y, eval_pos=eval_pos, task_type=task_type)
 
         # reshape 为 [bsz, num_query]
@@ -441,7 +447,6 @@ class KGPFN(nn.Module):
         context_ids: List[torch.Tensor],
         context_ys: List[torch.Tensor],
         context_texts: Optional[List] = None,
-        num_meta_context: int = 0,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         批量预计算 B 个上下文的 embedding。
@@ -468,7 +473,7 @@ class KGPFN(nn.Module):
         structure_aligned = None
         if self.structure_encoder is not None:
             structure_aligned, context_ys = self._build_structure_aligned(
-                data, all_ctx_ids, M, context_ys, num_meta_context=num_meta_context
+                data, all_ctx_ids, M, context_ys
             )
 
         # 文本路
@@ -551,6 +556,14 @@ class KGPFN(nn.Module):
                 score_feat = self.structure_score_norm(score_feat).unsqueeze(2)
                 query_structure = torch.cat([query_structure, score_feat], dim=2)
 
+            if self.context_graph > 0:
+                hop_feats = []
+                for k in range(1, self.context_graph + 1):
+                    h_k = self.structure_encoder.get_layer_output(data, query_id, layer_k=k, with_relation=False)
+                    h_k = self.context_graph_norm(self.context_graph_adapter(h_k))
+                    hop_feats.append(h_k.unsqueeze(2))
+                cg_feat = torch.cat(hop_feats, dim=2)  # [B, N, context_graph, D]
+                query_structure = torch.cat([cg_feat, query_structure], dim=2)
         # 文本路
         query_text_aligned = None
         if self.semantic_encoder is not None and query_text is not None:

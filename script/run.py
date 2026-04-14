@@ -230,6 +230,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     seq_chunk_size = cfg.model.get("seq_chunk_size", None)
     context_label_correction = bool(cfg.task.get("context_label_correction", False))
     with_relation = bool(cfg.model.get("with_relation", True))
+    context_graph = int(cfg.model.get("context_graph", 0))
     model = KGPFN(
         structure_encoder=structure_encoder,
         semantic_encoder=semantic_encoder,
@@ -243,6 +244,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         seq_chunk_size=seq_chunk_size,
         context_label_correction=context_label_correction,
         with_relation=with_relation,
+        context_graph=context_graph,
     )
 
     if init:
@@ -378,7 +380,6 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                     batch_neg,
                     num_pos=cfg.task.num_pos,
                     num_neg=cfg.task.num_neg,
-                    num_meta_context=int(cfg.task.get("num_meta_context", 0)),
                 )
 
                 # 3) 组织成 KGPFN / PFN 所需的输入格式（可选 text）
@@ -399,7 +400,6 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
                     context_x=context_x,
                     context_y=context_y,
                     task_type="reg",
-                    num_meta_context=int(cfg.task.get("num_meta_context", 0)),
                 )
 
                 # 5) 目标：正样本在 col 0，负样本在 col 1:
@@ -567,14 +567,12 @@ def test(cfg, model, test_data, device, logger, filtered_data=None, return_metri
             batch.unsqueeze(1).to(device),  # [B, 1, 3]
             num_pos=cfg.task.num_pos,
             num_neg=cfg.task.num_neg,
-            num_meta_context=int(cfg.task.get("num_meta_context", 0)),
         )
         # test_data.edge_index = filtered_data.edge_index
         # test_data.edge_type = filtered_data.edge_type
         # 3) 预计算上下文 embedding cache [B, M, *, D]，同时获取（可能修正的）标签
         context_cache, ctx_labels = model.get_context_embeddings_cache(
             test_data, ctx_triples, ctx_labels,
-            num_meta_context=int(cfg.task.get("num_meta_context", 0)),
         )
         
         # 4) 分 chunk 批量评测所有 tail 候选

@@ -188,6 +188,92 @@ class StructureEncoderRelationAware(nn.Module):
 
         return score
 
+    def get_layer_output(self, data, batch: torch.Tensor, layer_k: int, with_relation: bool = True) -> torch.Tensor:
+        """
+        Run EntityNBFNet up to layer_k (1-indexed) and return head entity embeddings.
+        batch: [B, S, 3], all rows must share the same relation.
+        Returns: [B, S, D] head embeddings at layer k.
+        """
+        assert batch.dim() == 3 and batch.size(-1) == 3
+        bsz, seq_len, _ = batch.shape
+        device = batch.device
+
+        query_rels = batch[:, 0, 2]
+        relation_representations = self.relation_model(data.relation_graph, query=query_rels)
+
+        unique_heads_all, unique_rels_all, row_unique_inverse, row_offsets = [], [], [], []
+        offset = 0
+        for i in range(bsz):
+            h_row = batch[i, :, 0]
+            h_unique, h_inv = torch.unique(h_row, sorted=False, return_inverse=True)
+            row_unique_inverse.append(h_inv)
+            row_offsets.append(offset)
+            offset += h_unique.numel()
+            unique_heads_all.append(h_unique)
+            unique_rels_all.append(torch.full_like(h_unique, query_rels[i]))
+
+        flat_h = torch.cat(unique_heads_all)
+        flat_r = torch.cat(unique_rels_all)
+        row_ids = torch.cat([
+            torch.full((uh.numel(),), i, dtype=torch.long, device=device)
+            for i, uh in enumerate(unique_heads_all)
+        ])
+        flat_rel_repr = relation_representations[row_ids]  # [U, R, D]
+
+        global_idx_2d = torch.stack(
+            [row_unique_inverse[i] + row_offsets[i] for i in range(bsz)], dim=0
+        )  # [B, S]
+        h_index = batch[:, :, 0]  # [B, S]
+
+        U = flat_h.size(0)
+        chunk_size = self.entity_chunk_size if self.entity_chunk_size is not None else U
+        h_embs = None
+
+        for start in range(0, U, chunk_size):
+            end = min(start + chunk_size, U)
+            h_chunk = flat_h[start:end]
+            r_chunk = flat_r[start:end]
+            rel_chunk = flat_rel_repr[start:end]
+
+            # Run bellmanford up to layer_k only
+            em = self.entity_model
+            em.query = rel_chunk
+            for layer in em.layers:
+                layer.relation = rel_chunk
+
+            batch_size = h_chunk.size(0)
+            query = rel_chunk[torch.arange(batch_size, device=device), r_chunk]
+            index = h_chunk.unsqueeze(-1).expand_as(query)
+            boundary = torch.zeros(batch_size, data.num_nodes, em.dims[0], device=device)
+            boundary.scatter_add_(1, index.unsqueeze(1), query.unsqueeze(1))
+            size = (data.num_nodes, data.num_nodes)
+            edge_weight = torch.ones(data.num_edges, device=device)
+
+            layer_input = boundary
+            k = min(layer_k, len(em.layers))
+            for layer in em.layers[:k]:
+                hidden = layer(layer_input, query, boundary, data.edge_index, data.edge_type, size, edge_weight)
+                if em.short_cut and hidden.shape == layer_input.shape:
+                    hidden = hidden + layer_input
+                layer_input = hidden
+
+            feat = layer_input  # [chunk, num_nodes, D]
+
+            if h_embs is None:
+                h_embs = feat.new_zeros(bsz, seq_len, feat.size(-1))
+
+            mask = (global_idx_2d >= start) & (global_idx_2d < end)
+            if mask.any():
+                b_idx, s_idx = mask.nonzero(as_tuple=True)
+                lu = global_idx_2d[b_idx, s_idx] - start
+                h_embs[b_idx, s_idx] = feat[lu, h_index[b_idx, s_idx]]
+
+            del feat
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return h_embs  # [B, S, D]
+
     def get_mlp_scores(self, t_emb: torch.Tensor) -> torch.Tensor:
         """
         直接用已 gather 好的 tail embedding 计算 MLP 得分。
