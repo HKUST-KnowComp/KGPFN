@@ -432,7 +432,10 @@ class KGPFN(nn.Module):
 
         # reshape 为 [bsz, num_query]
         if out.dim() == 3:
-            out = out.squeeze(-1)  # [B, N, 1] -> [B, N]
+            if out.size(-1) == 1:
+                out = out.squeeze(-1)  # [B, N, 1] -> [B, N]
+            else:
+                out = out[..., 1]      # [B, N, n_out] -> [B, N] (positive class logit)
         if out.dim() == 1:
             out = out.view(bsz, num_query)  # [B*N] -> [B, N]
         elif out.dim() == 2 and out.size(0) == bsz * num_query:
@@ -598,6 +601,11 @@ class KGPFN(nn.Module):
         eval_pos = M
         out = self.feature_transformer(full_fused, y, eval_pos=eval_pos, task_type=task_type)
 
+        if out.dim() == 3:
+            if out.size(-1) == 1:
+                out = out.squeeze(-1)  # [B, N, 1] -> [B, N]
+            else:
+                out = out[..., 1]      # [B, N, n_out] -> [B, N]
         if out.numel() == B * N:
             if out.dim() == 1:
                 out = out.view(B, N)

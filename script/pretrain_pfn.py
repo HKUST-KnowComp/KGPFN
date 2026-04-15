@@ -31,6 +31,8 @@ from model.ultra.encoder import StructureEncoderRelationAware
 from model.kgpfnsem import KGPFN
 from huggingface_hub import hf_hub_download
 from utils.loading import build_custom_model, load_state_dict_matching
+from model.tabpfn.architectures.base.config import ModelConfig
+from model.tabpfn.architectures.base.custom_transformer import CustomPerFeatureTransformer
 import wandb
 
 separator = ">" * 30
@@ -161,7 +163,7 @@ def _get_limix_thinking_rows(cfg):
 
 
 def _save_configs(cfg, args_config: str, working_dir: str):
-    """将本次运行的 input config 与 limix config 保存到 working_dir/config/"""
+    """将本次运行的 input config 与 feature_transformer config 保存到 working_dir/config/"""
     import shutil
     config_save_dir = os.path.join(working_dir, "config")
     os.makedirs(config_save_dir, exist_ok=True)
@@ -169,10 +171,14 @@ def _save_configs(cfg, args_config: str, working_dir: str):
     src = os.path.abspath(args_config)
     if os.path.isfile(src):
         shutil.copy2(src, os.path.join(config_save_dir, os.path.basename(src)))
-    # 2) 保存 limix config
-    limix_path = _get_limix_config_path(cfg)
-    if limix_path and os.path.isfile(limix_path):
-        shutil.copy2(limix_path, os.path.join(config_save_dir, os.path.basename(limix_path)))
+    # 2) 根据 feature_transformer 类型保存对应 config
+    ft_type = cfg.model.get("feature_transformer", "limix")
+    if ft_type == "tabpfn":
+        ft_path = cfg.train.get("tabpfn_config_path", "./config/tabpfn/tabpfn.yaml")
+    else:
+        ft_path = _get_limix_config_path(cfg)
+    if ft_path and os.path.isfile(ft_path):
+        shutil.copy2(ft_path, os.path.join(config_save_dir, os.path.basename(ft_path)))
 
 
 def wandb_init(cfg, logger):
@@ -222,11 +228,32 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     """
     structure_encoder = _build_structure_encoder(cfg)
 
-    # feature_transformer 结构由本地 limix config 决定（统一与 cfg 对齐）
-    yaml_path = _get_limix_config_path(cfg)
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        config_feature_transformer = yaml.safe_load(f)
-    feature_transformer = build_custom_model(config_feature_transformer)
+    # feature_transformer: limix (default) or tabpfn
+    ft_type = cfg.model.get("feature_transformer", "limix")
+    if ft_type == "tabpfn":
+        tabpfn_config_path = cfg.train.get("tabpfn_config_path", "./config/tabpfn/tabpfn.yaml")
+        with open(tabpfn_config_path, "r", encoding="utf-8") as f:
+            tabpfn_cfg = yaml.safe_load(f)
+        # "rope" is not a valid ModelConfig Literal — extract it before validation
+        use_rope = tabpfn_cfg.get("feature_positional_embedding") == "rope"
+        cfg_for_model = dict(tabpfn_cfg)
+        if use_rope:
+            cfg_for_model["feature_positional_embedding"] = None
+        model_config = ModelConfig(**ModelConfig.upgrade_config(cfg_for_model))
+        # Restore rope so CustomPerFeatureTransformer can detect it
+        if use_rope:
+            model_config.feature_positional_embedding = "rope"
+        structure_encoder_dim = tabpfn_cfg.get("structure_encoder_dim", 64)
+        feature_transformer = CustomPerFeatureTransformer(
+            config=model_config,
+            structure_encoder_dim=structure_encoder_dim,
+            n_out=model_config.max_num_classes or 10,
+        )
+    else:
+        yaml_path = _get_limix_config_path(cfg)
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            config_feature_transformer = yaml.safe_load(f)
+        feature_transformer = build_custom_model(config_feature_transformer)
 
     semantic_encoder = _build_semantic_encoder(cfg)
     semantic_dim = int(cfg.model.semantic_encoder.dim)
@@ -267,17 +294,27 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
             model.structure_encoder.load_state_dict(sd, strict=False)
 
         # 2) 初始化 feature transformer
-        limix_repo_id = cfg.train.get("limix_repo_id", "stableai-org/LimiX-16M")
-        limix_filename = cfg.train.get("limix_filename", "LimiX-16M.ckpt")
-        limix_cache_dir = cfg.train.get("limix_cache_dir", "/data/gaoyisen/LimiX/cache")
-        model_file = hf_hub_download(
-            repo_id=limix_repo_id,
-            filename=limix_filename,
-            local_dir=limix_cache_dir,
-        )
-        limix_state = torch.load(model_file, map_location=map_location, weights_only=False)
-        limix_sd = limix_state.get("state_dict", limix_state)
-        load_state_dict_matching(model.feature_transformer, limix_sd, strict_shape=True)
+        if ft_type == "tabpfn":
+            tabpfn_ckpt = cfg.train.get(
+                "tabpfn_ckpt_path",
+                "/home/gaoyisen/.cache/tabpfn/tabpfn-v2-classifier-finetuned-zk73skhh.ckpt",
+            )
+            tabpfn_state = torch.load(tabpfn_ckpt, map_location=map_location, weights_only=False)
+            tabpfn_sd = tabpfn_state.get("state_dict", tabpfn_state)
+            tabpfn_sd = {k: v for k, v in tabpfn_sd.items() if "criterion." not in k}
+            model.feature_transformer.load_state_dict(tabpfn_sd, strict=False)
+        else:
+            limix_repo_id = cfg.train.get("limix_repo_id", "stableai-org/LimiX-16M")
+            limix_filename = cfg.train.get("limix_filename", "LimiX-16M.ckpt")
+            limix_cache_dir = cfg.train.get("limix_cache_dir", "/data/gaoyisen/LimiX/cache")
+            model_file = hf_hub_download(
+                repo_id=limix_repo_id,
+                filename=limix_filename,
+                local_dir=limix_cache_dir,
+            )
+            limix_state = torch.load(model_file, map_location=map_location, weights_only=False)
+            limix_sd = limix_state.get("state_dict", limix_state)
+            load_state_dict_matching(model.feature_transformer, limix_sd, strict_shape=True)
         # print("Initialized complete")
     # 3) 可选：加载整体 KGPFN checkpoint（最高优先级）
     if ckpt_path:

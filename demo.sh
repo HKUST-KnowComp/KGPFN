@@ -11,16 +11,16 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 script/run.py \
 
 # for multi-graph pretraining
 CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_3g.yaml --gpus [0]
-CUDA_VISIBLE_DEVICES=0 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
+CUDA_VISIBLE_DEVICES=4 python script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0]
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 script/pretrain_pfn.py \
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 script/pretrain_pfn.py \
   -c config/transductive/train_all.yaml --gpus [0,1]
 
 CUDA_VISIBLE_DEVICES=6,7 accelerate launch --num_processes 2 script/pretrain_pfn.py -c config/transductive/train_all.yaml --gpus [0,1]
 #prepare data
 python script/run_many.py -c /data/gaoyisen/ultrapfn2/config/transductive/inference.yaml --gpus [0] --ckpt /data/gaoyisen/ULTRA/ckpts/ultra_4g.pth -d FB15k237Inductive:v1,FB15k237Inductive:v2,FB15k237Inductive:v3,FB15k237Inductive:v4
 
-
+CUDA_VISIBLE_DEVICES=4 python script/test_tabpfn_kg.py -c config/transductive/train_all.yaml --gpus [0,1]
 
 Test ULTRA model (ultra_50g.pth):                                                                                                                                                                                                                                                                                                            
 CUDA_VISIBLE_DEVICES=4 python script/run_many.py -c config/transductive/test_ultra.yaml --model_type ultra --ckpt ./ckpts/ultra_4g.pth --gpus [0]                                                                                                                             
