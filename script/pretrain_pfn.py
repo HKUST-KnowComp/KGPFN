@@ -905,7 +905,7 @@ if __name__ == "__main__":
         num_val_edges = cfg.train.fast_test
         if util.get_rank() == 0:
             logger.warning(f"Fast evaluation on {num_val_edges} samples in validation")
-        short_valid = [copy.deepcopy(vd) for vd in valid_data]
+        short_valid = [copy.deepcopy(vd) for vd in test_data]
         for graph in short_valid:
             mask = torch.randperm(graph.target_edge_index.shape[1])[:num_val_edges]
             graph.target_edge_index = graph.target_edge_index[:, mask]
@@ -954,7 +954,7 @@ if __name__ == "__main__":
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
+    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=test_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
     
 
     # if util.get_rank() == 0:
@@ -966,6 +966,6 @@ if __name__ == "__main__":
     #     logger.warning("Evaluate on test")
 
     # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
-    test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
+    test(cfg, model, short_valid, filtered_data=test_filtered_data, split="test")
     if util.get_rank() == 0 and use_wandb and wandb is not None:
         wandb.finish()
