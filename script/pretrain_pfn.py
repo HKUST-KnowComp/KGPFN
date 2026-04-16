@@ -175,6 +175,8 @@ def _save_configs(cfg, args_config: str, working_dir: str):
     ft_type = cfg.model.get("feature_transformer", "limix")
     if ft_type == "tabpfn":
         ft_path = cfg.train.get("tabpfn_config_path", "./config/tabpfn/tabpfn.yaml")
+    elif ft_type == "tabicl":
+        ft_path = cfg.train.get("tabicl_config_path", "./config/tabicl/tabicl.yaml")
     else:
         ft_path = _get_limix_config_path(cfg)
     if ft_path and os.path.isfile(ft_path):
@@ -228,7 +230,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     """
     structure_encoder = _build_structure_encoder(cfg)
 
-    # feature_transformer: limix (default) or tabpfn
+    # feature_transformer: limix (default) or tabpfn or tabicl
     ft_type = cfg.model.get("feature_transformer", "limix")
     if ft_type == "tabpfn":
         tabpfn_config_path = cfg.train.get("tabpfn_config_path", "./config/tabpfn/tabpfn.yaml")
@@ -249,6 +251,13 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
             structure_encoder_dim=structure_encoder_dim,
             n_out=model_config.max_num_classes or 10,
         )
+    elif ft_type == "tabicl":
+        from model.tabicl.model.custom_tabicl import build_custom_tabicl
+        tabicl_config_path = cfg.train.get("tabicl_config_path", "./config/tabicl/tabicl.yaml")
+        with open(tabicl_config_path, "r", encoding="utf-8") as f:
+            tabicl_cfg = yaml.safe_load(f)
+        structure_encoder_dim = tabicl_cfg.get("structure_encoder_dim", 64)
+        feature_transformer = build_custom_tabicl(tabicl_cfg, structure_encoder_dim=structure_encoder_dim)
     else:
         yaml_path = _get_limix_config_path(cfg)
         with open(yaml_path, "r", encoding="utf-8") as f:
@@ -303,6 +312,15 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
             tabpfn_sd = tabpfn_state.get("state_dict", tabpfn_state)
             tabpfn_sd = {k: v for k, v in tabpfn_sd.items() if "criterion." not in k}
             model.feature_transformer.load_state_dict(tabpfn_sd, strict=False)
+        elif ft_type == "tabicl":
+            tabicl_ckpt = cfg.train.get("tabicl_ckpt_path", None)
+            if tabicl_ckpt and os.path.exists(tabicl_ckpt):
+                tabicl_state = torch.load(tabicl_ckpt, map_location=map_location, weights_only=False)
+                tabicl_sd = tabicl_state.get("state_dict", tabicl_state)
+                # filter decoder: custom head has different shape from pretrained
+                tabicl_sd = {k: v for k, v in tabicl_sd.items() if not k.startswith("icl_predictor.decoder")}
+                model.feature_transformer.load_state_dict(tabicl_sd, strict=False)
+                print(f"Loaded tabicl ckpt from {tabicl_ckpt}")
         else:
             limix_repo_id = cfg.train.get("limix_repo_id", "stableai-org/LimiX-16M")
             limix_filename = cfg.train.get("limix_filename", "LimiX-16M.ckpt")
