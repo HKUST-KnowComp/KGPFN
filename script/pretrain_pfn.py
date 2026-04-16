@@ -494,7 +494,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     loss = loss + loss_weights[0] * bce_loss
                 if loss_weights[1] > 0:
                     sm_target = torch.zeros(pred.size(0), dtype=torch.long, device=pred.device)
-                    softmax_loss = F.cross_entropy(pred, sm_target, label_smoothing=label_smoothing)
+                    softmax_loss = F.cross_entropy(pred.float(), sm_target, label_smoothing=label_smoothing)
                     loss = loss + loss_weights[1] * softmax_loss
 
                 # accelerate handles gradient scaling for mixed precision automatically
@@ -706,7 +706,8 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                 eval_bce_loss = ((loss_raw * weight).sum(dim=-1) / weight.sum(dim=-1)).mean()
                 eval_loss = eval_loss + loss_weights[0] * eval_bce_loss
             if loss_weights[1] > 0:
-                eval_softmax_loss = F.cross_entropy(t_pred, pos_t_index.to(t_pred.device), label_smoothing=label_smoothing)
+
+                eval_softmax_loss = F.cross_entropy(t_pred.float(), pos_t_index.to(t_pred.device), label_smoothing=label_smoothing)
                 eval_loss = eval_loss + loss_weights[1] * eval_softmax_loss
             eval_losses.append(eval_loss.item())
             eval_bce_losses.append(eval_bce_loss.item())
