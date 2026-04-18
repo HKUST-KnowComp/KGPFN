@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../tabic
 
 from tabicl.model.interaction import RowInteraction
 from tabicl.model.learning import ICLearning
+from .thinking_tokens import AddThinkingRows
 
 
 class CustomTabICL(nn.Module):
@@ -42,6 +43,7 @@ class CustomTabICL(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        num_thinking_rows: int = 0,
         **kwargs,  # absorb unused yaml keys (col_*, num_quantiles, max_classes, etc.)
     ):
         super().__init__()
@@ -88,6 +90,12 @@ class CustomTabICL(nn.Module):
             nn.Linear(icl_dim, 1),
         )
 
+        self.num_thinking_rows = num_thinking_rows
+        if num_thinking_rows > 0:
+            self.thinking_rows = AddThinkingRows(num_thinking_rows, icl_dim)
+        else:
+            self.thinking_rows = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -114,7 +122,17 @@ class CustomTabICL(nn.Module):
 
         # ICLearning: y_train = labels for context rows only
         y_train = y[:, :eval_pos]       # [B, eval_pos]
-        out = self.icl_predictor(R, y_train)  # [B, N, 1]
+
+        if self.thinking_rows is not None:
+            R, new_train_size = self.thinking_rows(R, eval_pos)
+            y_train_icl = torch.zeros(
+                B, new_train_size, dtype=y_train.dtype, device=y_train.device
+            )
+            y_train_icl[:, self.num_thinking_rows:] = y_train
+        else:
+            y_train_icl = y_train
+
+        out = self.icl_predictor(R, y_train_icl)  # [B, N, 1]
 
         return out
 
