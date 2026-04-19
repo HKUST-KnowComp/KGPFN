@@ -277,6 +277,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
     context_label_correction = bool(cfg.task.get("context_label_correction", False))
     with_relation = bool(cfg.model.get("with_relation", True))
     context_graph = int(cfg.model.get("context_graph", 0))
+    context_tail = bool(cfg.model.get("context_tail", False))
     model = KGPFN(
         structure_encoder=structure_encoder,
         semantic_encoder=semantic_encoder,
@@ -291,6 +292,7 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         context_label_correction=context_label_correction,
         with_relation=with_relation,
         context_graph=context_graph,
+        context_tail=context_tail,
     )
 
     if init:

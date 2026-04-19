@@ -22,6 +22,7 @@ class KGPFN(nn.Module):
         context_label_correction: bool = False,
         with_relation: bool = True,
         context_graph: int = 0,
+        context_tail: bool = False,
     ):
         super().__init__()
         assert structure_encoder is not None or semantic_encoder is not None, \
@@ -46,6 +47,7 @@ class KGPFN(nn.Module):
         self.context_label_correction = context_label_correction
         self.with_relation = with_relation
         self.context_graph = context_graph
+        self.context_tail = context_tail
 
         dropout_rate = getattr(self, 'dropout', 0.0)
 
@@ -324,18 +326,19 @@ class KGPFN(nn.Module):
             score_feat = score_feat.unsqueeze(2)  # [B, S, 1, D]
             structure_aligned = torch.cat([structure_aligned, score_feat], dim=2)  # [B, S, 3+3+1, D] or [B, S, 3+1, D]
 
-        # context_graph: extract k-hop head embeddings and prepend as extra tokens
+        # context_graph: extract k-hop head (and optionally tail) embeddings and prepend as extra tokens
         if self.context_graph > 0:
-            # For each hop k=1..context_graph, get head emb at layer k: [B, S, D_raw]
-            # Then project to hidden_dim and stack as [B, S, context_graph, D]
             hop_feats = []
             for k in range(1, self.context_graph + 1):
                 h_k = self.structure_encoder.get_layer_output(data, all_id_triples, layer_k=k, with_relation=False)  # [B, S, D_raw]
-                h_k = self.context_graph_norm(self.context_graph_adapter(h_k))  # [B, S, D]
-                hop_feats.append(h_k.unsqueeze(2))  # [B, S, 1, D]
-            cg_feat = torch.cat(hop_feats, dim=2)  # [B, S, context_graph, D]
-            # Prepend context_graph tokens before the structure tokens
-            structure_aligned = torch.cat([cg_feat, structure_aligned], dim=2)  # [B, S, context_graph+..., D]
+                h_k = self.context_graph_norm(self.context_graph_adapter(h_k))
+                hop_feats.append(h_k.unsqueeze(2))
+                if self.context_tail:
+                    t_k = self.structure_encoder.get_layer_output(data, all_id_triples, layer_k=k, with_relation=False, use_tail=True)  # [B, S, D_raw]
+                    t_k = self.context_graph_norm(self.context_graph_adapter(t_k))
+                    hop_feats.append(t_k.unsqueeze(2))
+            cg_feat = torch.cat(hop_feats, dim=2)
+            structure_aligned = torch.cat([cg_feat, structure_aligned], dim=2)
             
         return structure_aligned, context_y
 
@@ -565,7 +568,11 @@ class KGPFN(nn.Module):
                     h_k = self.structure_encoder.get_layer_output(data, query_id, layer_k=k, with_relation=False)
                     h_k = self.context_graph_norm(self.context_graph_adapter(h_k))
                     hop_feats.append(h_k.unsqueeze(2))
-                cg_feat = torch.cat(hop_feats, dim=2)  # [B, N, context_graph, D]
+                    if self.context_tail:
+                        t_k = self.structure_encoder.get_layer_output(data, query_id, layer_k=k, with_relation=False, use_tail=True)
+                        t_k = self.context_graph_norm(self.context_graph_adapter(t_k))
+                        hop_feats.append(t_k.unsqueeze(2))
+                cg_feat = torch.cat(hop_feats, dim=2)
                 query_structure = torch.cat([cg_feat, query_structure], dim=2)
         # 文本路
         query_text_aligned = None

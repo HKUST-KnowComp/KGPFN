@@ -188,11 +188,12 @@ class StructureEncoderRelationAware(nn.Module):
 
         return score
 
-    def get_layer_output(self, data, batch: torch.Tensor, layer_k: int, with_relation: bool = True) -> torch.Tensor:
+    def get_layer_output(self, data, batch: torch.Tensor, layer_k: int, with_relation: bool = True, use_tail: bool = False) -> torch.Tensor:
         """
-        Run EntityNBFNet up to layer_k (1-indexed) and return head entity embeddings.
+        Run EntityNBFNet up to layer_k (1-indexed) and return head (or tail) entity embeddings.
         batch: [B, S, 3], all rows must share the same relation.
-        Returns: [B, S, D] head embeddings at layer k.
+        use_tail: if True, return tail node embedding in the head subgraph instead of head.
+        Returns: [B, S, D] embeddings at layer k.
         """
         assert batch.dim() == 3 and batch.size(-1) == 3
         bsz, seq_len, _ = batch.shape
@@ -224,6 +225,8 @@ class StructureEncoderRelationAware(nn.Module):
             [row_unique_inverse[i] + row_offsets[i] for i in range(bsz)], dim=0
         )  # [B, S]
         h_index = batch[:, :, 0]  # [B, S]
+        t_index = batch[:, :, 1]  # [B, S]
+        node_index = t_index if use_tail else h_index
 
         U = flat_h.size(0)
         chunk_size = self.entity_chunk_size if self.entity_chunk_size is not None else U
@@ -266,7 +269,7 @@ class StructureEncoderRelationAware(nn.Module):
             if mask.any():
                 b_idx, s_idx = mask.nonzero(as_tuple=True)
                 lu = global_idx_2d[b_idx, s_idx] - start
-                h_embs[b_idx, s_idx] = feat[lu, h_index[b_idx, s_idx]]
+                h_embs[b_idx, s_idx] = feat[lu, node_index[b_idx, s_idx]]
 
             del feat
             if torch.cuda.is_available():
