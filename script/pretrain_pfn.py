@@ -550,6 +550,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                         logger.warning("Evaluate on valid at step %d", batch_id)
                     _eval_model = accelerator.unwrap_model(parallel_model) if accelerator is not None else model
                     valid_mrr = test(cfg, _eval_model, valid_data, filtered_data=filtered_data, split="valid")
+                    parallel_model.train()
                     if is_main:
                         logger.warning("valid mrr: %g", valid_mrr)
                         if use_wandb and wandb is not None:
