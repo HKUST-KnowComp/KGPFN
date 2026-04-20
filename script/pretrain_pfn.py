@@ -499,6 +499,24 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     softmax_loss = F.cross_entropy(pred.float(), sm_target, label_smoothing=label_smoothing)
                     loss = loss + loss_weights[1] * softmax_loss
 
+                # NaN/Inf check before backward
+                if not pred.isfinite().all():
+                    raise RuntimeError(
+                        f"Non-finite pred detected at epoch {epoch}, batch {batch_id}: "
+                        f"nan={pred.isnan().sum().item()}, inf={pred.isinf().sum().item()}, "
+                        f"pred stats: min={pred.min().item()}, max={pred.max().item()}"
+                    )
+                if not loss.isfinite():
+                    raise RuntimeError(
+                        f"Non-finite loss detected at epoch {epoch}, batch {batch_id}: "
+                        f"loss={loss.item()}, bce_loss={bce_loss.item()}, softmax_loss={softmax_loss.item()}"
+                    )
+                if not loss.requires_grad:
+                    raise RuntimeError(
+                        f"loss has no grad_fn at epoch {epoch}, batch {batch_id}: "
+                        f"loss_weights={loss_weights}, loss={loss.item()}"
+                    )
+
                 # accelerate handles gradient scaling for mixed precision automatically
                 if accelerator is not None:
                     accelerator.backward(loss)
