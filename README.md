@@ -1,4 +1,4 @@
-# KGPFN
+# KGPFN: Unlocking the Potential of Knowledge Graph Foundation Model via In-Context Learning
 
 Knowledge graph link prediction framework combining:
 - **Structure encoder**:  relational message passing
