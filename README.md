@@ -9,9 +9,19 @@ Knowledge graph link prediction framework combining:
 ### 1. Environment Setup
 
 ```bash
-conda create -n kgpfn python=3.10
+conda create -n kgpfn python=3.12
 conda activate kgpfn
 pip install -r requirements.txt
+```
+
+**Flash Attention** (required for TabICL/LimiX):
+
+Download the prebuilt wheel matching your CUDA/PyTorch version from the [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases), then install:
+
+```bash
+# Example for CUDA 12.6 + PyTorch 2.7
+wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+pip install flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ```
 
 ### 2. Download Pretrained Models
