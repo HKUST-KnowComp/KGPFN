@@ -26,7 +26,7 @@ pip install flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x8
 
 ### 2. Download Pretrained Models
 
-Download structure encoder and feature transformer checkpoints:
+Download structure encoder and feature transformer checkpoints if you want to retrain KGPFN:
 
 ```bash
 # Download with TabICL as feature transformer (default)
@@ -36,7 +36,7 @@ python script/download.py --ft tabicl
 python script/download.py --ft limix
 ```
 
-Or directly download a fully pretrained KGPFN model directly:
+Or directly download a fully pretrained KGPFN model checkpoint:
 
 ```bash
 # tabicl as the pfn architecture (default)
