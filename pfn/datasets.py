@@ -3651,19 +3651,19 @@ class JointDataset(InMemoryDataset):
     datasets_map = {
         # ========== Transductive datasets (16个) ==========
         'FB15k237': FB15k237,
-        # 'FB15k237_10': FB15k237_10,  # FB15k237 稀疏子集 (10%) 111
-        # 'FB15k237_20': FB15k237_20,  # FB15k237 稀疏子集 (20%)
-        # 'FB15k237_50': FB15k237_50,  # FB15k237 稀疏子集 (50%)
+        'FB15k237_10': FB15k237_10,  # FB15k237 稀疏子集 (10%) 111
+        'FB15k237_20': FB15k237_20,  # FB15k237 稀疏子集 (20%)
+        'FB15k237_50': FB15k237_50,  # FB15k237 稀疏子集 (50%)
         'WN18RR': WN18RR,
         'CoDExSmall': CoDExSmall,
         'CoDExMedium': CoDExMedium,
         'CoDExLarge': CoDExLarge,
         'NELL995': NELL995,
-        # 'ConceptNet100k': ConceptNet100k,
+        'ConceptNet100k': ConceptNet100k,
         'DBpedia100k': DBpedia100k,
         'YAGO310': YAGO310,
         'AristoV4': AristoV4,
-        # 'Hetionet': Hetionet,
+        'Hetionet': Hetionet,
         'WDsinger': WDsinger,
         'NELL23k': NELL23k,
 
@@ -3675,7 +3675,7 @@ class JointDataset(InMemoryDataset):
         # ILPC datasets (2个)
         'ILPC2022': ILPC2022,                    # small, large (2个)
         # Hamaguchi datasets (4个)
-        # 'HM': HM,                                # 1k, 3k, 5k, indigo (4个) 111
+        'HM': HM,                                # 1k, 3k, 5k, indigo (4个) 111
 
         # ========== Inductive datasets - new nodes, new relations (23个) ==========
         # Ingram datasets (13个)
@@ -3688,7 +3688,7 @@ class JointDataset(InMemoryDataset):
         'WikiTopicsMT3': WikiTopicsMT3,          # art, infra (2个)
         'WikiTopicsMT4': WikiTopicsMT4,          # sci, health (2个)
         # MTDEA other datasets (2个)
-        # 'Metafam': Metafam,                      # Metafam (1个) 111
+        'Metafam': Metafam,                      # Metafam (1个) 111
         'FBNELL': FBNELL,                        # FBNELL_v1 (1个)
 
         # ========== Atlas datasets (排除在 all 之外) ==========

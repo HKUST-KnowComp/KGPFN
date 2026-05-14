@@ -44,8 +44,8 @@ def _build_semantic_encoder(cfg):
 
 
 def _build_structure_encoder(cfg):
-    name = str(cfg.model.get("structure_encoder_name", "ultra")).strip()
-    if name.lower() in ("", "none", "null"):
+    enabled = cfg.model.get("structure_encoder", True)
+    if not enabled:
         return None
     entity_model_cfg = copy.deepcopy(cfg.model.entity_model)
     entity_chunk_size = entity_model_cfg.pop("entity_chunk_size", None)

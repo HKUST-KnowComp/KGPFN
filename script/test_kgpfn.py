@@ -3,6 +3,7 @@ import os
 import sys
 import copy
 import math
+import csv
 import pprint
 import logging
 import io
@@ -37,6 +38,86 @@ import wandb
 
 separator = ">" * 30
 line = "-" * 30
+
+TRANSDUCTIVE_DATASETS = {
+    "FB15k237", "FB15k237_10", "FB15k237_20", "FB15k237_50",
+    "WN18RR", "CoDExSmall", "CoDExMedium", "CoDExLarge", "NELL995",
+    "ConceptNet100k", "DBpedia100k", "YAGO310", "AristoV4", "Hetionet",
+    "WDsinger", "NELL23k",
+}
+INDUCTIVE_DATASETS = {
+    "FB15k237Inductive", "WN18RRInductive", "NELLInductive",
+    "ILPC2022", "HM",
+}
+FULL_INDUCTIVE_DATASETS = {
+    "NLIngram", "FBIngram", "WKIngram", "WikiTopicsMT1", "WikiTopicsMT2",
+    "WikiTopicsMT3", "WikiTopicsMT4", "Metafam", "FBNELL",
+}
+
+
+def _match_dataset_family(dataset_name: str) -> str:
+    def _startswith_any(name: str, prefixes: set[str]) -> bool:
+        return any(name == p or name.startswith(f"{p}-") or name.startswith(f"{p}_") for p in prefixes)
+
+    if _startswith_any(dataset_name, TRANSDUCTIVE_DATASETS):
+        return "transductive"
+    if _startswith_any(dataset_name, INDUCTIVE_DATASETS):
+        return "inductive"
+    if _startswith_any(dataset_name, FULL_INDUCTIVE_DATASETS):
+        return "full_inductive"
+    return "unknown"
+
+
+def _format_metric(v: float) -> str:
+    if isinstance(v, float) and math.isnan(v):
+        return "nan"
+    return f"{v:.6f}"
+
+
+def _nanmean(vals: list[float]) -> float:
+    valid_vals = [v for v in vals if not math.isnan(v)]
+    if not valid_vals:
+        return float("nan")
+    return sum(valid_vals) / len(valid_vals)
+
+
+def _get_dataset_csv_path(cfg, split: str) -> str:
+    csv_name = f"metrics.csv"
+    checkpoint_dir = cfg.train.get("checkpoint_dir", ".")
+    csv_dir = os.path.dirname(os.path.abspath(checkpoint_dir))
+    os.makedirs(csv_dir, exist_ok=True)
+    return os.path.join(csv_dir, csv_name)
+
+
+def _write_dataset_csv(
+    csv_path: str,
+    dataset_records: list[tuple[str, float, float, str]],
+):
+
+    rows: list[list[str]] = []
+    for ds_name, mrr, hit10, _ in dataset_records:
+        rows.append([ds_name, "mrr", _format_metric(mrr)])
+        rows.append(["", "hit10", _format_metric(hit10)])
+        rows.append(["", "", ""])
+
+    group_specs = [
+        ("transductive_average", "transductive"),
+        ("inductive_average", "inductive"),
+        ("full_inductive_average", "full_inductive"),
+    ]
+    for idx, (label, group_name) in enumerate(group_specs):
+        selected = [r for r in dataset_records if r[3] == group_name]
+        avg_mrr = _nanmean([r[1] for r in selected])
+        avg_hit10 = _nanmean([r[2] for r in selected])
+        rows.append([label, "mrr", _format_metric(avg_mrr)])
+        rows.append(["", "hit10", _format_metric(avg_hit10)])
+        if idx != len(group_specs) - 1:
+            rows.append(["", "", ""])
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+    return csv_path
 
 
 def _build_semantic_encoder(cfg):
@@ -639,9 +720,20 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
     
     # test_data is a tuple of validation/test datasets
     # process sequentially
-    all_metrics = []
+    all_metrics: list[float] = []
     collected_metric_values: dict[str, list[float]] = {}
+    dataset_records: list[tuple[str, float, float, str]] = []
     default_num_neg = int(cfg.task.num_neg)
+    for graph_idx, test_graph in enumerate(test_data):
+        graph_name = getattr(test_graph, "dataset", f"graph_{graph_idx}")
+        dataset_records.append((graph_name, float("nan"), float("nan"), _match_dataset_family(graph_name)))
+
+    csv_path = _get_dataset_csv_path(cfg, split)
+    if rank == 0:
+        # 先按当前评测数据集创建 CSV，后续每个数据集完成后实时覆盖更新
+        _write_dataset_csv(csv_path, dataset_records)
+        logger.warning("Per-dataset csv initialized at %s", csv_path)
+
     for graph_idx, (test_graph, filters) in enumerate(zip(test_data, filtered_data)):
         graph_name = getattr(test_graph, "dataset", f"graph_{graph_idx}")
         is_nell_inductive_v1 = graph_name == "NELLInductive-v1"
@@ -858,11 +950,23 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
             logger.warning("[%s] loss: %g, bce_loss: %g, softmax_loss: %g",
                            graph_name, avg_eval_loss, avg_eval_bce, avg_eval_softmax)
         mrr = (1 / all_ranking.float()).mean()
+        hit10 = (all_ranking <= 10).float().mean()
 
-        all_metrics.append(mrr)
+        mrr_value = float(mrr.item())
+        if not math.isnan(mrr_value):
+            all_metrics.append(mrr_value)
         if rank == 0:
-            graph_metrics["mrr"] = float(mrr.item())
+            graph_metrics["mrr"] = mrr_value
             logger.warning("[%s] mrr: %g", graph_name, graph_metrics["mrr"])
+            graph_metrics["hits@10"] = float(hit10.item())
+            logger.warning("[%s] hits@10: %g", graph_name, graph_metrics["hits@10"])
+            dataset_records[graph_idx] = (
+                graph_name,
+                graph_metrics["mrr"],
+                graph_metrics["hits@10"],
+                _match_dataset_family(graph_name),
+            )
+            _write_dataset_csv(csv_path, dataset_records)
             for k, v in graph_metrics.items():
                 collected_metric_values.setdefault(k, []).append(v)
 
@@ -871,12 +975,15 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
             logger.warning("[%s] No dataset produced valid rankings; return NaN metric.", split)
         avg_metric = torch.tensor(float("nan"), device=device)
     else:
-        avg_metric = sum(all_metrics) / len(all_metrics)
+        avg_metric = torch.tensor(_nanmean(all_metrics), device=device)
     if rank == 0 and wandb is not None and wandb.run is not None and collected_metric_values:
         # 记录每次完整评测后的平均指标到 summary
         for metric_name, values in collected_metric_values.items():
-            wandb.run.summary[f"{split}/{metric_name}_avg"] = float(sum(values) / len(values))
+            wandb.run.summary[f"{split}/{metric_name}_avg"] = float(_nanmean(values))
         wandb.run.summary[f"{split}/mrr_return"] = float(avg_metric.item())
+    if rank == 0:
+        _write_dataset_csv(csv_path, dataset_records)
+        logger.warning("Per-dataset csv saved to %s", csv_path)
     return avg_metric
 
 
@@ -969,47 +1076,47 @@ if __name__ == "__main__":
     )
 
     model = model.to(device)
-    print(model)
-    # assert task_name == "MultiGraphPretraining", "Only the MultiGraphPretraining task is allowed for this script"
+  
+    assert task_name == "MultiGraphPretraining", "Only the MultiGraphPretraining task is allowed for this script"
 
-    # # Build per-split filtered data using each target graph's own edge space and node count.
-    # #
-    # # Using each graph's edge_index (the context graph) + target_edge_index (prediction targets)
-    # # correctly handles both transductive and inductive settings:
-    # #   - Transductive: edge_index already contains all edges; num_nodes is shared.
-    # #   - Inductive: test entities differ from train entities; using test_graph.num_nodes
-    # #     fixes the shape mismatch (test_graph.num_nodes != train_graph.num_nodes) that
-    # #     caused compute_ranking to crash with mismatched tensor dimensions.
-    # def _make_filtered_data(graphs):
-    #     return [
-    #         Data(
-    #             edge_index=torch.cat([g.edge_index, g.target_edge_index], dim=1),
-    #             edge_type=torch.cat([g.edge_type, g.target_edge_type]),
-    #             num_nodes=g.num_nodes,
-    #         ).to(device)
-    #         for g in graphs
-    #     ]
+    # Build per-split filtered data using each target graph's own edge space and node count.
+    #
+    # Using each graph's edge_index (the context graph) + target_edge_index (prediction targets)
+    # correctly handles both transductive and inductive settings:
+    #   - Transductive: edge_index already contains all edges; num_nodes is shared.
+    #   - Inductive: test entities differ from train entities; using test_graph.num_nodes
+    #     fixes the shape mismatch (test_graph.num_nodes != train_graph.num_nodes) that
+    #     caused compute_ranking to crash with mismatched tensor dimensions.
+    def _make_filtered_data(graphs):
+        return [
+            Data(
+                edge_index=torch.cat([g.edge_index, g.target_edge_index], dim=1),
+                edge_type=torch.cat([g.edge_type, g.target_edge_type]),
+                num_nodes=g.num_nodes,
+            ).to(device)
+            for g in graphs
+        ]
 
-    # valid_filtered_data = _make_filtered_data(valid_data)
-    # test_filtered_data = _make_filtered_data(test_data)
+    valid_filtered_data = _make_filtered_data(valid_data)
+    test_filtered_data = _make_filtered_data(test_data)
 
-    # # checkpoint_dir 相对 working_dir 解析（因未 chdir，需显式拼接）
-    # ckpt_dir = getattr(cfg.train, "checkpoint_dir", ".")
-    # if not os.path.isabs(ckpt_dir):
-    #     cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
+    # checkpoint_dir 相对 working_dir 解析（因未 chdir，需显式拼接）
+    ckpt_dir = getattr(cfg.train, "checkpoint_dir", ".")
+    if not os.path.isabs(ckpt_dir):
+        cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    # train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
+    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
     
 
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on valid")
-    # # test(cfg, model, valid_data, filtered_data=filtered_data)
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on test")
+    # if util.get_rank() == 0:
+    #     logger.warning(separator)
+    #     logger.warning("Evaluate on valid")
+    # test(cfg, model, valid_data, filtered_data=filtered_data)
+    # if util.get_rank() == 0:
+    #     logger.warning(separator)
+    #     logger.warning("Evaluate on test")
 
-    # # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
-    # test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
-    # if util.get_rank() == 0 and use_wandb and wandb is not None:
-    #     wandb.finish()
+    # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
+    test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
+    if util.get_rank() == 0 and use_wandb and wandb is not None:
+        wandb.finish()
