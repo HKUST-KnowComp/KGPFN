@@ -760,19 +760,23 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
         fn_total = torch.zeros(1, dtype=torch.float32, device=device)
         eval_losses, eval_bce_losses, eval_softmax_losses = [], [], []
         for batch in test_loader:
-            # 1) 严格负采样评测：tail 全候选
-            t_batch, _ = tasks.all_negative(test_graph, batch)  # (B, num_nodes, 3)
+            # Evaluate the original query and its tail-side inverse query.
+            reverse_batch = tasks.inverse_relation_queries(test_graph, batch)
+            eval_batch = torch.cat([batch, reverse_batch], dim=0)
+
+            # 1) 严格负采样评测：两组 query 都枚举全部候选 tail。
+            t_batch, _ = tasks.all_negative(test_graph, eval_batch)
             B, num_nodes, _ = t_batch.shape
 
             if filtered_data is None:
-                t_mask, h_mask = tasks.strict_negative_mask(test_graph, batch)
+                t_mask, h_mask = tasks.strict_negative_mask(test_graph, eval_batch)
             else:
-                t_mask, h_mask = tasks.strict_negative_mask(filters, batch)
-            pos_h_index, pos_t_index, pos_r_index = batch.t()
+                t_mask, h_mask = tasks.strict_negative_mask(filters, eval_batch)
+            pos_h_index, pos_t_index, pos_r_index = eval_batch.t()
 
             # 2) 对每个 batch 行只构建一次上下文，在多个 chunk 间复用
             # build_context_for_batch 期望 [B, N, 3]，这里用 N=1 的锚点 query
-            row_anchor_batch = batch.unsqueeze(1)
+            row_anchor_batch = eval_batch.unsqueeze(1)
             try:
                 shared_context_x, shared_context_y = tasks.build_context_relation_aware(
                     test_graph,
@@ -835,7 +839,7 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
             eval_bce_losses.append(eval_bce_loss.item())
             eval_softmax_losses.append(eval_softmax_loss.item())
 
-            # 4) ranking（这里按 tail-only 汇总，契合当前 (h,r,?) 设定）
+            # 4) ranking（原始 tail + 反向 relation 的 head，合并汇总）
             t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
             num_t_negative = t_mask.sum(dim=-1)
 
@@ -990,6 +994,7 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
 if __name__ == "__main__":
     args, vars = util.parse_args()
     cfg = util.load_config(args.config, context=vars)
+    util.apply_model_config(cfg)
     # 在 chdir 前将相对路径解析为相对于项目根目录的绝对路径
     project_root = _get_project_root()
     for key in ("structure_encoder_path", "limix_cache_dir", "limix_config_path", "kgpfn_checkpoint"):
@@ -1088,14 +1093,20 @@ if __name__ == "__main__":
     #     fixes the shape mismatch (test_graph.num_nodes != train_graph.num_nodes) that
     #     caused compute_ranking to crash with mismatched tensor dimensions.
     def _make_filtered_data(graphs):
-        return [
-            Data(
-                edge_index=torch.cat([g.edge_index, g.target_edge_index], dim=1),
-                edge_type=torch.cat([g.edge_type, g.target_edge_type]),
+        filtered = []
+        for g in graphs:
+            inverse_target_index = g.target_edge_index.flip(0)
+            inverse_target_type = g.target_edge_type + g.num_relations // 2
+            filtered.append(Data(
+                edge_index=torch.cat([
+                    g.edge_index, g.target_edge_index, inverse_target_index
+                ], dim=1),
+                edge_type=torch.cat([
+                    g.edge_type, g.target_edge_type, inverse_target_type
+                ]),
                 num_nodes=g.num_nodes,
-            ).to(device)
-            for g in graphs
-        ]
+            ).to(device))
+        return filtered
 
     valid_filtered_data = _make_filtered_data(valid_data)
     test_filtered_data = _make_filtered_data(test_data)

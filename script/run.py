@@ -520,8 +520,8 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
 @torch.no_grad()
 def test(cfg, model, test_data, device, logger, filtered_data=None, return_metrics=False, split: str = "test"):
     """
-    单图数据集评测函数（tail-only）：
-    1. 只评测 tail
+    单图数据集评测函数（双向）：
+    1. 评测原始 tail，并通过反向 relation 评测原始 head
     2. 统一构建上下文，得到 embedding_cache
     3. 根据 chunk 不断计算分数
     4. 同时计算正负样本 BCE loss（用于诊断）
@@ -552,21 +552,24 @@ def test(cfg, model, test_data, device, logger, filtered_data=None, return_metri
     test_iterator = tqdm(test_loader, desc="Evaluating", disable=rank != 0)
     
     for batch in test_iterator:
-        
-        # 1) 严格负采样评测：tail 全候选
-        t_batch, _ = tasks.all_negative(test_data, batch)  # (B, num_nodes, 3)
+        # Evaluate the original query and its tail-side inverse query.
+        reverse_batch = tasks.inverse_relation_queries(test_data, batch)
+        eval_batch = torch.cat([batch, reverse_batch], dim=0)
+
+        # 1) 严格负采样评测：两组 query 都枚举全部候选 tail。
+        t_batch, _ = tasks.all_negative(test_data, eval_batch)
         B, num_nodes, _ = t_batch.shape
         
         if filtered_data is None:
-            t_mask, _ = tasks.strict_negative_mask(test_data, batch)
+            t_mask, _ = tasks.strict_negative_mask(test_data, eval_batch)
         else:
-            t_mask, _ = tasks.strict_negative_mask(filtered_data, batch)
-        pos_h_index, pos_t_index, pos_r_index = batch.t()
+            t_mask, _ = tasks.strict_negative_mask(filtered_data, eval_batch)
+        pos_h_index, pos_t_index, pos_r_index = eval_batch.t()
 
         # 2) 批量构建所有上下文（统一为当前 batch 构建）
         ctx_triples, ctx_labels = tasks.build_context_relation_aware(
             test_data,
-            batch.unsqueeze(1).to(device),  # [B, 1, 3]
+            eval_batch.unsqueeze(1).to(device),
             num_pos=cfg.task.num_pos,
             num_neg=cfg.task.num_neg,
         )
@@ -685,10 +688,11 @@ def test_encoder(cfg, model, test_data, device, logger, filtered_data=None, retu
     rankings = []
     num_negatives = []
     tail_rankings, num_tail_negs = [], []  # for explicit tail-only evaluation needed for 5 datasets
+    tail_only = tasks.is_tail_only_dataset(getattr(test_data, "dataset", ""))
     for batch in test_loader:
         t_batch, h_batch = tasks.all_negative(test_data, batch)
         t_pred = inner_model.structure_encoder.get_score(test_data, t_batch)
-        h_pred = inner_model.structure_encoder.get_score(test_data, h_batch)
+        h_pred = None if tail_only else inner_model.structure_encoder.get_score(test_data, h_batch)
       
         if filtered_data is None:
             t_mask, h_mask = tasks.strict_negative_mask(test_data, batch)
@@ -696,12 +700,15 @@ def test_encoder(cfg, model, test_data, device, logger, filtered_data=None, retu
             t_mask, h_mask = tasks.strict_negative_mask(filtered_data, batch)
         pos_h_index, pos_t_index, pos_r_index = batch.t()
         t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
-        h_ranking = tasks.compute_ranking(h_pred, pos_h_index, h_mask)
         num_t_negative = t_mask.sum(dim=-1)
-        num_h_negative = h_mask.sum(dim=-1)
 
-        rankings += [t_ranking, h_ranking]
-        num_negatives += [num_t_negative, num_h_negative]
+        rankings.append(t_ranking)
+        num_negatives.append(num_t_negative)
+        if not tail_only:
+            h_ranking = tasks.compute_ranking(h_pred, pos_h_index, h_mask)
+            num_h_negative = h_mask.sum(dim=-1)
+            rankings.append(h_ranking)
+            num_negatives.append(num_h_negative)
 
         tail_rankings += [t_ranking]
         num_tail_negs += [num_t_negative]
@@ -782,6 +789,7 @@ def test_encoder(cfg, model, test_data, device, logger, filtered_data=None, retu
 if __name__ == "__main__":
     args, vars = util.parse_args()
     cfg = util.load_config(args.config, context=vars)
+    util.apply_model_config(cfg)
     working_dir = util.create_working_directory(cfg, chdir=False)
 
     if util.get_rank() == 0:
@@ -840,22 +848,37 @@ if __name__ == "__main__":
 
     model = model.to(device)
 
+    def _target_edges_with_inverses(graphs):
+        """Return split target edges plus their reverse-relation edges."""
+        edge_indices = []
+        edge_types = []
+        for graph in graphs:
+            edge_indices.extend([graph.target_edge_index, graph.target_edge_index.flip(0)])
+            edge_types.extend([
+                graph.target_edge_type,
+                graph.target_edge_type + graph.num_relations // 2,
+            ])
+        return torch.cat(edge_indices, dim=1), torch.cat(edge_types)
+
     # for transductive setting, use the whole graph for filtered ranking
     if task_name == "InductiveInference":
         # filtering for inductive datasets
         if "ILPC" in cfg.dataset['class'] or "Ingram" in cfg.dataset['class']:
-            full_inference_edges = torch.cat([valid_data.edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1)
-            full_inference_etypes = torch.cat([valid_data.edge_type, valid_data.target_edge_type, test_data.target_edge_type])
+            target_edges, target_types = _target_edges_with_inverses([valid_data, test_data])
+            full_inference_edges = torch.cat([valid_data.edge_index, target_edges], dim=1)
+            full_inference_etypes = torch.cat([valid_data.edge_type, target_types])
             filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
         else:
-            full_inference_edges = torch.cat([test_data.edge_index, test_data.target_edge_index], dim=1)
-            full_inference_etypes = torch.cat([test_data.edge_type, test_data.target_edge_type])
+            target_edges, target_types = _target_edges_with_inverses([test_data])
+            full_inference_edges = torch.cat([test_data.edge_index, target_edges], dim=1)
+            full_inference_etypes = torch.cat([test_data.edge_type, target_types])
             filtered_data = Data(edge_index=full_inference_edges, edge_type=full_inference_etypes, num_nodes=test_data.num_nodes)
     else:
         # for transductive setting
+        target_edges, target_types = _target_edges_with_inverses([train_data, valid_data, test_data])
         filtered_data = Data(
-            edge_index=torch.cat([train_data.target_edge_index, valid_data.target_edge_index, test_data.target_edge_index], dim=1),
-            edge_type=torch.cat([train_data.target_edge_type, valid_data.target_edge_type, test_data.target_edge_type]),
+            edge_index=target_edges,
+            edge_type=target_types,
             num_nodes=train_data.num_nodes,
         ).to(device)
         val_filtered_data = test_filtered_data = filtered_data

@@ -7,6 +7,26 @@ from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph as pyg_k_hop_subgraph
 
 
+TAIL_ONLY_DATASETS = {
+    "wdsinger",
+    "nell23k",
+    "fb15k237_10",
+    "fb15k237_20",
+    "fb15k237_50",
+    "wd-singer",
+    "nell-23k",
+    "fb15k-237-10",
+    "fb15k-237-20",
+    "fb15k-237-50",
+}
+
+
+def is_tail_only_dataset(dataset_name):
+    """Whether a dataset has an explicitly tail-only evaluation protocol."""
+    name = str(dataset_name).strip().lower()
+    return name in TAIL_ONLY_DATASETS
+
+
 def edge_match(edge_index, query_index):
     # O((n + q)logn) time
     # O(n) memory
@@ -125,6 +145,24 @@ def all_negative(data, batch):
     h_batch = torch.stack([h_index, t_index, r_index], dim=-1)
 
     return t_batch, h_batch
+
+
+def inverse_relation_queries(data, batch):
+    """Convert ``(h, r, t)`` into the inverse query ``(t, r^-1, h)``.
+
+    The inverse query evaluates the original edge from the tail side: the
+    original head becomes the positive tail candidate.
+    """
+    if is_tail_only_dataset(getattr(data, "dataset", "")):
+        return batch.new_empty((0, 3))
+    if data.num_relations < 2 or data.num_relations % 2:
+        raise ValueError(
+            f"Cannot infer inverse relation IDs from num_relations={data.num_relations}"
+        )
+    base = data.num_relations // 2
+    h_index, t_index, r_index = batch.t()
+    inverse_r = torch.where(r_index < base, r_index + base, r_index - base)
+    return torch.stack([t_index, h_index, inverse_r], dim=-1)
 
 
 def strict_negative_mask(data, batch):

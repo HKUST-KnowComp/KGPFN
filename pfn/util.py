@@ -42,6 +42,44 @@ def load_config(cfg_file, context=None):
     return cfg
 
 
+def apply_model_config(cfg, project_root=None):
+    """Optionally overlay ``cfg.model`` from a separate YAML file.
+
+    The override file may contain a top-level ``model`` mapping (the preferred
+    format) or the model mapping itself. Existing model values are retained
+    when the override only specifies a subset of fields.
+    """
+    config_path = cfg.get("model_config_path", None)
+    if not config_path:
+        return cfg
+
+    if project_root is None:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if not os.path.isabs(config_path):
+        config_path = os.path.abspath(os.path.join(project_root, config_path))
+
+    with open(config_path, "r", encoding="utf-8") as fin:
+        override = yaml.safe_load(fin) or {}
+    if not isinstance(override, dict):
+        raise TypeError(f"model_config_path must contain a YAML mapping: {config_path}")
+    model_override = override.get("model", override)
+    if not isinstance(model_override, dict):
+        raise TypeError(f"model_config_path.model must be a YAML mapping: {config_path}")
+
+    def merge_dict(base, extra):
+        merged = dict(base or {})
+        for key, value in extra.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    cfg.model = easydict.EasyDict(merge_dict(dict(cfg.get("model", {})), model_override))
+    logger.info("Loaded model configuration override from %s", config_path)
+    return cfg
+
+
 def literal_eval(string):
     try:
         return ast.literal_eval(string)
@@ -192,4 +230,3 @@ def build_dataset(cfg):
                             ))
 
     return dataset
-
