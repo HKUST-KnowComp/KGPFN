@@ -1,5 +1,5 @@
 output_dir: ./output
-model_config_path: null
+model_config_path: null # null, ./config/kgpfn/{model_name}.yaml
 
 dataset:
   class: JointDataset
@@ -52,7 +52,25 @@ task:
   loss_weights: [1.0, 1.0]
   # label_smoothing: only used for softmax loss; 0.0 = no smoothing
   label_smoothing: 0.1
+  # also train each triple as a (t, r^-1, ?) query; doubles the effective batch size
+  train_inverse: yes
+  # full-graph batches drop their B positives and B inverse edges from the observed graph
+  mask_query_edges: True
+  # [tail, head]: average each side first, then combine by these weights
+  side_loss_weights: [1.0, 1.0]
   context_label_correction: True
+  # Support/query episodes, sampled online during training (pfn/episode.py): each original
+  # relation keeps a rho fraction of its train edges as the support graph (inverses added,
+  # largest connected component only); the remaining edges inside it are the query pool.
+  # A new split is drawn every steps_per_episode steps. A graph whose split fails
+  # resample_retries times falls back to full-graph training with mask_query_edges.
+  episode:
+    enabled: true
+    rho: [0.5, 0.9]
+    rho_jitter: 0.08
+    steps_per_episode: 10
+    max_retries: 8
+    resample_retries: 3
   
 
 optimizer:
@@ -69,6 +87,7 @@ train:
   valid_eval_step_interval: 500
  
   # eval params
+  # subsample of the official test split, used only by the test eval (not for checkpointing)
   fast_test: 256
   eval_chunk_size: 256
 

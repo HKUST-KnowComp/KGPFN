@@ -1,3 +1,24 @@
+"""Two-stage KGPFN finetuning.
+
+Stage 1 (``structure_encoder``): train only the structure encoder for
+``train.structure_encoder_epoch`` epochs with ULTRA's own link-prediction loss;
+adapter + feature_transformer (PFN) stay frozen.
+
+Stage 2 (``pfn``): freeze the structure encoder, train adapter + PFN for
+``train.pfn_epoch`` epochs. ``train.finetune_mode`` selects how:
+
+- ``episode``: sample a fresh support/query split of the train graph online with
+  the ratios in ``task.episode`` (rho / rho_jitter), train on the query pool.
+- ``full``:    train on the whole train graph; each batch's query edges (and
+  their inverses) are removed from the observed graph before prediction
+  (``task.mask_query_edges``).
+
+The model with the best valid MRR (either stage) is evaluated on test at the end.
+
+Usage:
+    python script/finetune.py -c config/script/finetune.yaml --gpus [0]
+"""
+
 import glob
 import os
 import sys
@@ -262,6 +283,34 @@ def _set_module_trainable(module, trainable: bool):
     module.train(trainable)
 
 
+def _structure_encoder(model):
+    inner = model.module if hasattr(model, "module") else model
+    return getattr(inner, "structure_encoder", None)
+
+
+# children that are never trained in the adapter+PFN stage
+PFN_STAGE_FROZEN = ("structure_encoder", "semantic_encoder")
+
+
+def _set_stage_trainable(model, stage: str) -> None:
+    """Toggle per-child trainability for the two finetune stages.
+
+    - stage="structure_encoder": train only the structure encoder.
+    - stage="pfn": freeze structure/semantic encoders, train everything else
+      (entity/relation/text/score adapters, norms, feature_transformer).
+    """
+    if stage not in ("structure_encoder", "pfn"):
+        raise ValueError(f"unknown finetune stage: {stage}")
+    inner = model.module if hasattr(model, "module") else model
+    for name, child in inner.named_children():
+        if not isinstance(child, nn.Module):
+            continue
+        if stage == "structure_encoder":
+            _set_module_trainable(child, name == "structure_encoder")
+        else:
+            _set_module_trainable(child, name not in PFN_STAGE_FROZEN)
+
+
 def _resolve_inverse_relation_semantic_mode(cfg) -> str:
     mode = str(cfg.train.get("inverse_relation_semantic_mode", "text")).strip().lower()
     if mode not in ("text", "negate"):
@@ -469,6 +518,30 @@ def _resolve_path(path: str | None, project_root: str) -> str | None:
     return os.path.abspath(os.path.join(project_root, path))
 
 
+def _subsample_targets(graphs, n):
+    """Copy of each graph keeping at most ``n`` target triples. Observed edges stay intact."""
+    n = int(n)
+    out = []
+    for graph in graphs:
+        sampled = copy.deepcopy(graph)
+        n_edges = sampled.target_edge_index.shape[1]
+        if n_edges > n:
+            mask = torch.randperm(n_edges)[:n]
+            sampled.target_edge_index = sampled.target_edge_index[:, mask]
+            sampled.target_edge_type = sampled.target_edge_type[mask]
+        out.append(sampled)
+    return out
+
+
+def _as_batch_per_epoch(value):
+    """YAML ``null`` / ``"null"`` -> None (full train pass); otherwise int."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in ("null", "none", ""):
+        return None
+    return int(value)
+
+
 def _get_limix_config_path(cfg):
     # 允许从配置覆盖 limix config 路径；默认沿用当前脚本内的本地配置文件
     default_dir = os.path.join(_get_project_root(), "config", "limix")
@@ -668,25 +741,305 @@ def create_model(cfg, init: bool = False, ckpt_path: str | None = None, map_loca
         print("Loaded model from checkpoint")
 
     _set_module_trainable(model.semantic_encoder, False)
-    _set_module_trainable(model.structure_encoder, False)
+    # structure_encoder 的冻结/解冻由两阶段流程控制（_set_stage_trainable），这里不冻结
 
     print("Model created complete")
     return model
 
 
-# here we assume that train_data and valid_data are tuples of datasets
-def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, batch_per_epoch=None, accelerator=None):
+def train_structure_encoder_stage(cfg, model, train_data, valid_data, filtered_data=None,
+                                  batch_per_epoch=None, num_epoch=0, lr=None,
+                                  batch_id=0, best_mrr=-1.0):
+    """Stage 1: finetune the structure encoder with ULTRA's own link-prediction loss.
+
+    Scores the 1+N candidates directly through ``EntityNBFNet``'s MLP head instead
+    of backpropagating through the frozen PFN. Two reasons:
+
+    - Memory. The PFN path encodes the relation-aware context as well, so a step
+      touches ~100 distinct (h, r) pairs per row. Once the encoder is trainable,
+      autograd keeps a ``[num_nodes, D]`` activation per pair per layer, which is
+      three orders of magnitude more than the frozen case. Scoring candidates
+      directly keeps one (h, r) per row.
+    - Coverage. ``entity_model.mlp`` is only ever reached under ``no_grad`` in
+      ``KGPFN`` (label correction / score enhancement), so
+      the PFN path never trains the score head at all.
+
+    Trains on the full train graph; ``EntityNBFNet.remove_easy_edges`` drops each
+    batch's query edges and their inverses on its own while in training mode.
     """
+    if num_epoch == 0:
+        return batch_id, best_mrr
+
+    encoder = _structure_encoder(model)
+    if encoder is None:
+        raise RuntimeError("stage 'structure_encoder' requires a structure encoder")
+
+    stage = "structure_encoder"
+    rank = util.get_rank()
+    world_size = util.get_world_size()
+    is_main = (rank == 0)
+    _device = device
+
+    # Full pass (null) is tens of thousands of steps on YAGO/Hetionet; do not
+    # also fire valid_eval_step_interval inside the epoch (that interval is for
+    # the capped PFN stage). Evaluate once at the end of each encoder epoch.
+    full_pass = batch_per_epoch is None
+    if batch_per_epoch is None:
+        total = sum(g.target_edge_index.shape[1] for g in train_data)
+        batch_per_epoch = max(1, total // (cfg.train.batch_size * world_size))
+
+    cls = cfg.optimizer.get("class", "AdamW")
+    opt_kwargs = {k: v for k, v in cfg.optimizer.items() if k not in ("class", "lr")}
+    if opt_kwargs.get("weight_decay", 0.0) is None:
+        opt_kwargs["weight_decay"] = 0.0
+    if lr is None:
+        lr = float(cfg.optimizer.get("lr", 5.0e-5))
+    trainable_params = [p for p in encoder.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError(f"stage '{stage}': encoder has no trainable parameters")
+    optimizer = getattr(optim, cls)(trainable_params, lr=lr, **opt_kwargs)
+
+    if world_size > 1:
+        # Scoring goes straight through `encoder`, so a DDP wrapper around the
+        # model would never see this forward and gradients would not sync.
+        raise NotImplementedError(
+            "stage 'structure_encoder' is single-process only; "
+            "run with one rank or set train.structure_encoder_epoch: 0"
+        )
+
+    checkpoint_dir = getattr(cfg.train, "checkpoint_dir", ".")
+    max_checkpoints = int(cfg.train.get("max_checkpoints", 20))
+    adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
+    loss_weights = list(cfg.task.get("loss_weights", [1.0, 0.0]))
+    label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
+    train_inverse = bool(cfg.task.get("train_inverse", True))
+    side_loss_weights = list(cfg.task.get("side_loss_weights", [1.0, 1.0]))
+    if len(side_loss_weights) != 2:
+        raise ValueError(f"side_loss_weights must be [tail, head], got {side_loss_weights}")
+    w_tail, w_head = float(side_loss_weights[0]), float(side_loss_weights[1])
+    use_wandb = bool(cfg.train.get("use_wandb", False))
+    valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
+    graph_id_buf = torch.zeros(1, dtype=torch.long, device=_device)
+    graph_probs = torch.tensor(
+        [g.edge_index.shape[1] for g in train_data], dtype=torch.float, device=_device
+    )
+    graph_probs /= graph_probs.sum()
+
+    num_params = sum(p.numel() for p in encoder.parameters())
+    num_trainable = sum(p.numel() for p in trainable_params)
+    logger.warning(line)
+    logger.warning(
+        f"[{stage}] ULTRA objective on 1+{int(cfg.task.num_negative)} candidates; "
+        f"encoder params: {num_params}, trainable: {num_trainable}, lr: {lr}, "
+        f"batch_per_epoch: {batch_per_epoch}{' (full pass)' if full_pass else ''}"
+    )
+
+    def _valid_eval(epoch):
+        nonlocal best_mrr
+        if is_main:
+            logger.warning(separator)
+            logger.warning("[%s] Evaluate on valid at step %d (epoch %d)", stage, batch_id, epoch)
+        valid_mrr = test(cfg, model, valid_data, filtered_data=filtered_data, split="valid")
+        model.train()
+        _set_frozen_encoders_eval(model)
+        if is_main:
+            logger.warning("[%s] valid mrr (KGPFN, used for checkpoint): %g", stage, valid_mrr)
+            if use_wandb and wandb is not None:
+                wandb.log({"valid/mrr": float(valid_mrr), "train/epoch": epoch}, step=batch_id)
+            valid_mrr_f = float(valid_mrr)
+            if valid_mrr_f > best_mrr:
+                best_mrr = valid_mrr_f
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                best_path = os.path.join(checkpoint_dir, "model_best.pth")
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": batch_id,
+                        "epoch": epoch,
+                        "valid_mrr": valid_mrr_f,
+                        "best_mrr": valid_mrr_f,
+                        "stage": stage,
+                    },
+                    best_path,
+                )
+                logger.warning(f"New best MRR {best_mrr:.4f}, save to {best_path}")
+
+    step = math.ceil(num_epoch / 10)
+    for i in range(0, num_epoch, step):
+        for epoch in range(i, min(num_epoch, i + step)):
+            if is_main:
+                logger.warning(separator)
+                logger.warning(f"[{stage}] Epoch {epoch} begin")
+
+            # training mode matters: remove_easy_edges only fires when training
+            model.train()
+            _set_frozen_encoders_eval(model)
+            losses, bce_losses, softmax_losses, tail_losses, head_losses = [], [], [], [], []
+            for _ in range(batch_per_epoch):
+                if rank == 0:
+                    graph_id_buf[0] = torch.multinomial(graph_probs, 1).item()
+                if world_size > 1:
+                    dist.broadcast(graph_id_buf, src=0)
+                train_graph = train_data[int(graph_id_buf.item())]
+
+                perm = torch.randperm(train_graph.target_edge_index.shape[1], device=_device)[:cfg.train.batch_size]
+                batch = torch.cat([
+                    train_graph.target_edge_index[:, perm],
+                    train_graph.target_edge_type[perm].unsqueeze(0),
+                ]).t()
+
+                n_tail = int(batch.size(0))
+                if train_inverse:
+                    batch = tasks.augment_with_inverse_queries(train_graph, batch)
+                batch_with_neg = tasks.negative_sampling_tail(
+                    train_graph,
+                    batch,
+                    cfg.task.num_negative,
+                    strict=cfg.task.strict_negative,
+                )  # (B, 1+N, 3)
+
+                # ULTRA scoring: one (h, r) per row, tail candidates in column dim
+                query_rels = batch_with_neg[:, 0, 2]
+                rel_repr = encoder.relation_model(train_graph.relation_graph, query=query_rels)
+                pred = encoder.entity_model(
+                    train_graph, rel_repr, batch_with_neg, return_score=True
+                )  # (B, 1+N)
+
+                bce_row, softmax_row = _candidate_row_losses(
+                    pred,
+                    loss_weights=loss_weights,
+                    adversarial_temperature=adversarial_temperature,
+                    num_negative=int(cfg.task.num_negative),
+                    label_smoothing=label_smoothing,
+                )
+                row_loss = loss_weights[0] * bce_row + loss_weights[1] * softmax_row
+                loss, tail_loss, head_loss, n_head = _side_combine(row_loss, n_tail, w_tail, w_head)
+                if loss is None:
+                    raise RuntimeError(
+                        f"no side loss to backprop at epoch {epoch}, batch {batch_id}: "
+                        f"n_tail={n_tail}, n_head={n_head}, side_loss_weights=[{w_tail}, {w_head}]"
+                    )
+                if not pred.isfinite().all():
+                    raise RuntimeError(
+                        f"[{stage}] non-finite pred at epoch {epoch}, batch {batch_id}: "
+                        f"nan={pred.isnan().sum().item()}, inf={pred.isinf().sum().item()}"
+                    )
+                if not loss.isfinite():
+                    raise RuntimeError(
+                        f"[{stage}] non-finite loss at epoch {epoch}, batch {batch_id}: loss={loss.item()}"
+                    )
+
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+                if batch_id % cfg.train.log_interval == 0:
+                    logger.warning(separator)
+                    logger.warning(
+                        "[%s] total loss: %g, bce_loss: %g, softmax_loss: %g, tail_loss: %g, head_loss: %g",
+                        stage, loss.item(), bce_row.mean().item(), softmax_row.mean().item(),
+                        tail_loss.item() if n_tail > 0 else float("nan"),
+                        head_loss.item() if n_head > 0 else float("nan"),
+                    )
+                    if use_wandb and is_main and wandb is not None:
+                        wandb.log(
+                            {
+                                "train/loss_step": loss.item(),
+                                "train/stage1_ultra_loss": loss.item(),
+                                "train/epoch": epoch,
+                                "train/step": batch_id,
+                            },
+                            step=batch_id,
+                        )
+                losses.append(loss.item())
+                bce_losses.append(bce_row.mean().item())
+                softmax_losses.append(softmax_row.mean().item())
+                if n_tail > 0:
+                    tail_losses.append(tail_loss.item())
+                if n_head > 0:
+                    head_losses.append(head_loss.item())
+                batch_id += 1
+
+                if (not full_pass) and valid_eval_step_interval > 0 and (batch_id % valid_eval_step_interval == 0):
+                    _valid_eval(epoch)
+
+            logger.warning(separator)
+            logger.warning(f"[{stage}] Epoch {epoch} end")
+            logger.warning(line)
+            logger.warning(
+                "[%s] average loss: %g, avg_bce_loss: %g, avg_softmax_loss: %g, "
+                "avg_tail_loss: %g, avg_head_loss: %g",
+                stage,
+                sum(losses) / len(losses),
+                sum(bce_losses) / len(bce_losses),
+                sum(softmax_losses) / len(softmax_losses),
+                sum(tail_losses) / len(tail_losses) if tail_losses else float("nan"),
+                sum(head_losses) / len(head_losses) if head_losses else float("nan"),
+            )
+            if full_pass:
+                _valid_eval(epoch)
+            if use_wandb and is_main and wandb is not None:
+                wandb.log(
+                    {
+                        "train/loss_epoch": sum(losses) / len(losses),
+                        "train/metric": sum(losses) / len(losses),
+                        "train/epoch": epoch,
+                    },
+                    step=batch_id,
+                )
+
+            if is_main:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                epoch_ckpt_path = os.path.join(checkpoint_dir, f"model_{stage}_epoch_{epoch}.pth")
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": batch_id,
+                        "epoch": epoch,
+                        "best_mrr_so_far": best_mrr,
+                    },
+                    epoch_ckpt_path,
+                )
+                logger.warning(f"Save epoch checkpoint to {epoch_ckpt_path}")
+                epoch_ckpts = sorted(
+                    glob.glob(os.path.join(checkpoint_dir, f"model_{stage}_epoch_*.pth")),
+                    key=lambda p: int(os.path.basename(p).split(f"model_{stage}_epoch_")[-1].replace(".pth", "")),
+                )
+                for old_ckpt in epoch_ckpts[:-max_checkpoints]:
+                    try:
+                        os.remove(old_ckpt)
+                        logger.warning(f"Remove old epoch checkpoint: {old_ckpt}")
+                    except OSError:
+                        pass
+
+        util.synchronize()
+
+    return batch_id, best_mrr
+
+
+# here we assume that train_data and valid_data are tuples of datasets
+def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, batch_per_epoch=None,
+                       accelerator=None, num_epoch=None, lr=None, stage="pfn",
+                       batch_id=0, best_mrr=-1.0):
+    """Train the adapter + PFN stage and return (batch_id, best_mrr).
+
     accelerator: optional Accelerator instance.
       - If provided: uses accelerator.prepare() for DDP + mixed precision,
         accelerator.backward() for loss, and accelerator.unwrap_model() for saves.
       - If None: falls back to manual DDP (original behavior).
       In both cases, graph selection is synchronized via dist.broadcast so all
       ranks always process the same graph per step (fixes DDP timeout from load imbalance).
+
+    num_epoch / lr: stage overrides (default: cfg.train.num_epoch / cfg.optimizer.lr).
+    stage: used for logging and checkpoint names.
     """
 
-    if cfg.train.num_epoch == 0:
-        return
+    if num_epoch is None:
+        num_epoch = int(cfg.train.num_epoch)
+    if num_epoch == 0:
+        return batch_id, best_mrr
 
     if accelerator is not None:
         world_size = accelerator.num_processes
@@ -712,22 +1065,31 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     # Shared buffer for broadcasting the selected graph index across ranks
     graph_id_buf = torch.zeros(1, dtype=torch.long, device=_device)
 
-    cls = cfg.optimizer.pop("class")
+    cls = cfg.optimizer.get("class", "AdamW")
+    opt_kwargs = {k: v for k, v in cfg.optimizer.items() if k not in ("class", "lr")}
+    # yaml 里 weight_decay: null 表示关闭；torch 不接受 None
+    if opt_kwargs.get("weight_decay", 0.0) is None:
+        opt_kwargs["weight_decay"] = 0.0
+    if lr is None:
+        lr = float(cfg.optimizer.get("lr", 5.0e-5))
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = getattr(optim, cls)(trainable_params, **cfg.optimizer)
+    if not trainable_params:
+        raise RuntimeError(f"stage '{stage}': no trainable parameters")
+    optimizer = getattr(optim, cls)(trainable_params, lr=lr, **opt_kwargs)
     num_params = sum(p.numel() for p in model.parameters())
+    num_trainable = sum(p.numel() for p in trainable_params)
     logger.warning(line)
-    logger.warning(f"Number of parameters: {num_params}")
+    logger.warning(f"[{stage}] Number of parameters: {num_params}, trainable: {num_trainable}, lr: {lr}")
 
     if accelerator is not None:
-        # accelerate handles DDP wrapping and device placement
-        parallel_model, optimizer = accelerator.prepare(model, optimizer)
+        # re-wrap per stage so requires_grad changes between stages are picked up
+        parallel_model, optimizer = accelerator.prepare(accelerator.unwrap_model(model), optimizer)
     elif world_size > 1:
         parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
     else:
         parallel_model = model
 
-    step = math.ceil(cfg.train.num_epoch / 10)
+    step = math.ceil(num_epoch / 10)
 
     # checkpoint：每个 epoch 结束保存 model_epoch_*.pth；valid 上 eval 仅在有新高时保存 model_best.pth
     checkpoint_dir = getattr(cfg.train, "checkpoint_dir", ".")  # 相对 working_dir 或绝对路径
@@ -755,7 +1117,6 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     fallback_graphs: set[int] = set()
     use_wandb = bool(cfg.train.get("use_wandb", False))
     valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
-    best_mrr = -1.0  # 用于保存 MRR 最优的 checkpoint
 
     if is_main:
         logger.warning("Side loss weights [tail, head]: [%g, %g]", w_tail, w_head)
@@ -791,14 +1152,13 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     # 当前 episode：同一个 support 图连续训练 episode_steps 步后再换下一张图
     active_episode: dict | None = None
 
-    batch_id = 0
-    for i in range(0, cfg.train.num_epoch, step):
+    for i in range(0, num_epoch, step):
         parallel_model.train()
         _set_frozen_encoders_eval(parallel_model)
-        for epoch in range(i, min(cfg.train.num_epoch, i + step)):
+        for epoch in range(i, min(num_epoch, i + step)):
             if is_main:
                 logger.warning(separator)
-                logger.warning("Epoch %d begin" % epoch)
+                logger.warning(f"[{stage}] Epoch {epoch} begin")
 
             losses = []
             bce_losses = []
@@ -996,7 +1356,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     parallel_model.train()
                     _set_frozen_encoders_eval(parallel_model)
                     if is_main:
-                        logger.warning("valid mrr: %g", valid_mrr)
+                        logger.warning("[%s] valid mrr: %g", stage, valid_mrr)
                         if use_wandb and wandb is not None:
                             wandb.log(
                                 {
@@ -1018,7 +1378,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                                 "epoch": epoch,
                                 "valid_mrr": valid_mrr_f,
                             }
-                            best_state = {**state, "best_mrr": valid_mrr_f}
+                            best_state = {**state, "best_mrr": valid_mrr_f, "stage": stage}
                             torch.save(best_state, best_path)
                             logger.warning(f"New best MRR {best_mrr:.4f}, save to {best_path}")
 
@@ -1029,7 +1389,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
             avg_tail_loss = _nanmean(tail_losses)
             avg_head_loss = _nanmean(head_losses)
             logger.warning(separator)
-            logger.warning("Epoch %d end" % epoch)
+            logger.warning(f"[{stage}] Epoch {epoch} end")
             logger.warning(line)
             logger.warning(
                 "average loss: %g, avg_bce_loss: %g, avg_softmax_loss: %g, avg_tail_loss: %g, avg_head_loss: %g" % (
@@ -1051,7 +1411,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
 
             if is_main:
                 os.makedirs(checkpoint_dir, exist_ok=True)
-                epoch_ckpt_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pth")
+                epoch_ckpt_path = os.path.join(checkpoint_dir, f"model_{stage}_epoch_{epoch}.pth")
                 _save_model = accelerator.unwrap_model(parallel_model) if accelerator is not None else model
                 epoch_state = {
                     "model": _save_model.state_dict(),
@@ -1063,8 +1423,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                 torch.save(epoch_state, epoch_ckpt_path)
                 logger.warning(f"Save epoch checkpoint to {epoch_ckpt_path}")
                 epoch_ckpts = sorted(
-                    glob.glob(os.path.join(checkpoint_dir, "model_epoch_*.pth")),
-                    key=lambda p: int(os.path.basename(p).split("model_epoch_")[-1].replace(".pth", "")),
+                    glob.glob(os.path.join(checkpoint_dir, f"model_{stage}_epoch_*.pth")),
+                    key=lambda p: int(os.path.basename(p).split(f"model_{stage}_epoch_")[-1].replace(".pth", "")),
                 )
                 for old_ckpt in epoch_ckpts[:-max_checkpoints]:
                     try:
@@ -1074,6 +1434,8 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                         pass
 
         util.synchronize()
+
+    return batch_id, best_mrr
 
 
 @torch.no_grad()
@@ -1360,11 +1722,11 @@ if __name__ == "__main__":
 
     torch.manual_seed(args.seed + util.get_rank())
 
-    # 日志：输出到控制台 + .log 文件（默认 pretrain_pfn.log，写入 working_dir）
+    # 日志：输出到控制台 + .log 文件（默认 finetune.log，写入 working_dir）
     # 必须用 abspath，否则 chdir(working_dir) 后相对路径会重复解析
     logger = util.get_root_logger(file=False)
     if util.get_rank() == 0:
-        log_file = getattr(cfg.train, "log_file", "pretrain_pfn.log")
+        log_file = getattr(cfg.train, "log_file", "finetune.log")
         if not os.path.isabs(log_file):
             log_file = os.path.join(working_dir, log_file)
         # 使用 mode="w" 每次运行覆盖旧日志
@@ -1390,6 +1752,10 @@ if __name__ == "__main__":
     train_data = [td.to(device) for td in train_data]
     valid_data = [vd.to(device) for vd in valid_data]
     test_data = [tst.to(device) for tst in test_data]
+    # fast_test only shortens the final test eval. Checkpointing uses the full valid split.
+    eval_test = _subsample_targets(test_data, cfg.train.fast_test) if "fast_test" in cfg.train else test_data
+    if "fast_test" in cfg.train and util.get_rank() == 0:
+        logger.warning("Fast test: %d target triples per graph of the test split", int(cfg.train.fast_test))
 
     model = create_model(
         cfg,
@@ -1423,17 +1789,100 @@ if __name__ == "__main__":
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    train_and_validate(cfg, model, train_data, valid_data, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
+    # ── adapter+PFN 训练模式：episode / full ─────────────────────────────────
+    # episode: 按 task.episode 的 rho 比例在线从 train 图抽 support/query 来训
+    # full:    用整张 train 图，mask_query_edges 移除当前 batch 的边再做预测
+    finetune_mode = str(cfg.train.get("finetune_mode", "episode")).strip().lower()
+    if finetune_mode not in ("episode", "full"):
+        raise ValueError(f"unknown train.finetune_mode={finetune_mode}, expected 'episode' or 'full'")
+    episode_cfg = dict(cfg.task.get("episode", {}) or {})
+    episode_cfg["enabled"] = finetune_mode == "episode"
+    cfg.task.episode = episode_cfg
+    if finetune_mode == "full":
+        cfg.task.mask_query_edges = True
+    if util.get_rank() == 0:
+        if finetune_mode == "episode":
+            logger.warning(
+                "Finetune mode: episode (rho=%s, jitter=%s, steps_per_episode=%s)",
+                episode_cfg.get("rho", [0.7, 0.9]),
+                episode_cfg.get("rho_jitter", 0.08),
+                episode_cfg.get("steps_per_episode", 25),
+            )
+        else:
+            logger.warning("Finetune mode: full graph with per-batch query-edge masking")
 
+    # ── 两阶段 finetune ──────────────────────────────────────────────────────
+    # stage 1: 只训练 structure encoder（adapter + PFN 冻结）
+    # stage 2: 冻结 structure encoder，训练 adapter + PFN
+    se_epoch = int(cfg.train.get("structure_encoder_epoch", 0))
+    pfn_epoch = int(cfg.train.get("pfn_epoch", cfg.train.get("num_epoch", 0)))
+    se_lr = cfg.train.get("structure_encoder_lr", None)
+    pfn_lr = cfg.train.get("pfn_lr", None)
+    eval_valid = valid_data
 
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on valid")
-    # # test(cfg, model, valid_data, filtered_data=filtered_data)
-    # # if util.get_rank() == 0:
-    # #     logger.warning(separator)
-    # #     logger.warning("Evaluate on test")
+    se_bpe_raw = cfg.train.get("structure_encoder_batch_per_epoch", "__missing__")
+    if se_bpe_raw == "__missing__":
+        se_bpe_raw = cfg.train.get("batch_per_epoch")
+    se_bpe = _as_batch_per_epoch(se_bpe_raw)
+    pfn_bpe = _as_batch_per_epoch(cfg.train.get("batch_per_epoch"))
 
-    # # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
-    # if util.get_rank() == 0 and use_wandb and wandb is not None:
-    #     wandb.finish()
+    batch_id, best_mrr = 0, -1.0
+    if se_epoch > 0:
+        if model.structure_encoder is None:
+            raise RuntimeError("structure_encoder_epoch > 0 but the model has no structure encoder")
+        _set_stage_trainable(model, "structure_encoder")
+        if util.get_rank() == 0:
+            logger.warning(separator)
+            logger.warning(
+                "Stage 1: train structure encoder for %d epochs (lr=%s, ULTRA objective, "
+                "batch_per_epoch=%s)",
+                se_epoch, se_lr, "full pass" if se_bpe is None else se_bpe,
+            )
+        batch_id, best_mrr = train_structure_encoder_stage(
+            cfg, model, train_data, eval_valid,
+            filtered_data=valid_filtered_data, batch_per_epoch=se_bpe,
+            num_epoch=se_epoch, lr=se_lr, batch_id=batch_id, best_mrr=best_mrr,
+        )
+        if util.get_rank() == 0:
+            stage1_path = os.path.join(cfg.train.checkpoint_dir, "model_stage1_structure_encoder.pth")
+            torch.save({"model": model.state_dict(), "step": batch_id, "best_mrr": best_mrr}, stage1_path)
+            logger.warning("Stage 1 finished, save to %s", stage1_path)
+
+    if pfn_epoch > 0:
+        _set_stage_trainable(model, "pfn")
+        if util.get_rank() == 0:
+            logger.warning(separator)
+            logger.warning(
+                "Stage 2: freeze structure encoder, train adapter + PFN for %d epochs (mode=%s, lr=%s)",
+                pfn_epoch, finetune_mode, pfn_lr,
+            )
+        batch_id, best_mrr = train_and_validate(
+            cfg, model, train_data, eval_valid,
+            filtered_data=valid_filtered_data, batch_per_epoch=pfn_bpe,
+            accelerator=accelerator, num_epoch=pfn_epoch, lr=pfn_lr,
+            stage="pfn", batch_id=batch_id, best_mrr=best_mrr,
+        )
+
+    # ── 用 valid 最优 checkpoint 在 test 上评估 ──────────────────────────────
+    if bool(cfg.train.get("skip_final_test", False)):
+        if util.get_rank() == 0:
+            logger.warning(separator)
+            logger.warning("skip_final_test=true; not evaluating the test split")
+    else:
+        if util.get_rank() == 0:
+            logger.warning(separator)
+            logger.warning("Evaluate on test")
+        best_path = os.path.join(cfg.train.checkpoint_dir, "model_best.pth")
+        if os.path.exists(best_path):
+            state = torch.load(best_path, map_location=device)
+            model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state, strict=False)
+            if util.get_rank() == 0:
+                logger.warning(
+                    "Loaded best checkpoint from %s (valid mrr=%s, produced by stage=%s, epoch=%s)",
+                    best_path, state.get("best_mrr", "NA"), state.get("stage", "NA"), state.get("epoch", "NA"),
+                )
+        elif util.get_rank() == 0:
+            logger.warning("model_best.pth not found (valid_eval_step_interval=0?); evaluate the final model")
+        test(cfg, model, eval_test, filtered_data=test_filtered_data, split="test")
+    if util.get_rank() == 0 and use_wandb and wandb is not None:
+        wandb.finish()

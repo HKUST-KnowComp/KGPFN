@@ -253,6 +253,80 @@ class KGPFN(nn.Module):
             new_y.append(y_i)
         return new_y
 
+    def _apply_structure_enhance(self, structure_aligned: torch.Tensor) -> torch.Tensor:
+        """Append TransE(h+r-t) / DistMult(h*r*t) / cos(h+r, t) tokens. [B, S, F, D]."""
+        if not self.enhance_structure:
+            return structure_aligned
+        h_s = structure_aligned[:, :, 0, :]
+        r_s = structure_aligned[:, :, 1, :]
+        t_s = structure_aligned[:, :, 2, :]
+        bsz, seq_len, _ = h_s.shape
+        transe_feat = h_s + r_s - t_s
+        distmult_feat = h_s * r_s * t_s
+        cos_feat = (
+            F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8)
+            .unsqueeze(-1)
+            .expand(-1, -1, self.hidden_dim)
+        )
+        enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
+        enh_delta = self.structure_enhance_adapter(enh_in).reshape(
+            bsz, seq_len, 3, self.hidden_dim
+        )
+        enh_delta = self.structure_enhance_norm(enh_delta)
+        return torch.cat([structure_aligned, enh_delta], dim=2)
+
+    def _tokens_from_gathered(
+        self,
+        h_emb: torch.Tensor,
+        r_emb: torch.Tensor,
+        t_emb: torch.Tensor,
+        hops_h: Optional[List[torch.Tensor]] = None,
+        hops_t: Optional[List[torch.Tensor]] = None,
+        structure_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Assemble structure tokens from already-gathered embeddings. [B, S, F, D].
+
+        ``hops_h[k]`` / ``hops_t[k]`` are the raw layer-(k+1) states of the head /
+        tail; ``structure_scores`` must be given when ``structure_score_enhance``
+        is on and ``t_emb`` was encoded without the relation concat.
+        """
+        h_s = self.entity_adapter(h_emb)
+        r_s = self.relation_adapter(r_emb)
+        t_s = self.entity_adapter(t_emb)
+        structure_aligned = self.structure_norm(torch.stack([h_s, r_s, t_s], dim=2))
+        structure_aligned = self._apply_structure_enhance(structure_aligned)
+        if self.structure_score_enhance:
+            if structure_scores is None:
+                with torch.no_grad():
+                    structure_scores = self.structure_encoder.get_mlp_scores(t_emb)
+            score_feat = self.structure_score_adapter(structure_scores.unsqueeze(-1))
+            score_feat = self.structure_score_norm(score_feat).unsqueeze(2)
+            structure_aligned = torch.cat([structure_aligned, score_feat], dim=2)
+        if self.context_graph > 0:
+            hop_feats = []
+            for k in range(self.context_graph):
+                h_k = self.context_graph_norm(self.context_graph_adapter(hops_h[k]))
+                hop_feats.append(h_k.unsqueeze(2))
+                if self.context_tail:
+                    t_k = self.context_graph_norm(self.context_graph_adapter(hops_t[k]))
+                    hop_feats.append(t_k.unsqueeze(2))
+            structure_aligned = torch.cat([torch.cat(hop_feats, dim=2), structure_aligned], dim=2)
+        return structure_aligned
+
+    def _encode_structure(self, data: Any, all_id_triples: torch.Tensor):
+        """One NBFNet pass per unique (h, r): final h/r/t embeddings plus hop states."""
+        return self.structure_encoder.encode_seq(
+            data, all_id_triples, with_relation=self.with_relation, n_hop=self.context_graph
+        )
+
+    def _mlp_tail_embeddings(self, data: Any, all_id_triples: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        """Tail embeddings the ULTRA MLP head expects (always with the relation concat)."""
+        if self.with_relation:
+            return t_emb
+        with torch.no_grad():
+            _, t_emb_for_mlp, _ = self.structure_encoder(data, all_id_triples, with_relation=True)
+        return t_emb_for_mlp
+
     def _build_structure_aligned(
         self,
         data: Any,
@@ -265,19 +339,11 @@ class KGPFN(nn.Module):
         当 context_graph > 0 时，对每个三元组额外提取 1..k hop 的头实体 embedding，
         经 adapter 后拼接到序列最前面（每个 hop 作为一个额外 token）。
         """
-        bsz, seq_len, _ = all_id_triples.shape
+        h_emb, r_emb, t_emb, hops_h, hops_t = self._encode_structure(data, all_id_triples)
 
-        h_emb, r_emb, t_emb = self._triples_to_embeddings(data, all_id_triples)
+        need_mlp = self.context_label_correction or self.structure_score_enhance
+        t_emb_for_mlp = self._mlp_tail_embeddings(data, all_id_triples, t_emb) if need_mlp else None
 
-        # Label correction / structure_score_enhance 需要 with_relation=True 的 128 维 t_emb
-        need_mlp_t_emb = (self.context_label_correction or self.structure_score_enhance) and not self.with_relation
-        if need_mlp_t_emb:
-            with torch.no_grad():
-                _, t_emb_for_mlp, _ = self.structure_encoder(data, all_id_triples, with_relation=True)
-        else:
-            t_emb_for_mlp = t_emb
-
-        # Label correction (if enabled)
         if self.context_label_correction:
             with torch.no_grad():
                 ctx_scores = self.structure_encoder.get_mlp_scores(
@@ -285,61 +351,14 @@ class KGPFN(nn.Module):
                 )
             context_y = self._apply_label_correction(ctx_scores, context_y)
 
-        # Compute structure scores for all triples (if structure_score_enhance enabled)
         structure_scores = None
         if self.structure_score_enhance:
             with torch.no_grad():
                 structure_scores = self.structure_encoder.get_mlp_scores(t_emb_for_mlp)
 
-        # Apply adapters
-        h_emb = self.entity_adapter(h_emb)
-        r_emb = self.relation_adapter(r_emb)
-        t_emb = self.entity_adapter(t_emb)
-        id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
-        structure_aligned = self.structure_norm(id_feat)
-
-        # Structure enhancement (TransE, DistMult, Cosine)
-        if self.enhance_structure:
-            h_s = structure_aligned[:, :, 0, :]
-            r_s = structure_aligned[:, :, 1, :]
-            t_s = structure_aligned[:, :, 2, :]
-            transe_feat = h_s + r_s - t_s
-            distmult_feat = h_s * r_s * t_s
-            cos_feat = (
-                F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8)
-                .unsqueeze(-1)
-                .expand(-1, -1, self.hidden_dim)
-            )
-            enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
-            enh_delta = self.structure_enhance_adapter(enh_in).reshape(
-                bsz, seq_len, 3, self.hidden_dim
-            )
-            enh_delta = self.structure_enhance_norm(enh_delta)
-            structure_aligned = torch.cat([structure_aligned, enh_delta], dim=2)
-
-        # Structure score enhancement (ULTRA MLP score as feature)
-        if self.structure_score_enhance:
-            # structure_scores: [B, S] -> [B, S, 1] -> [B, S, D] via adapter
-            score_feat = structure_scores.unsqueeze(-1)  # [B, S, 1]
-            score_feat = self.structure_score_adapter(score_feat)  # [B, S, D]
-            score_feat = self.structure_score_norm(score_feat)  # [B, S, D]
-            score_feat = score_feat.unsqueeze(2)  # [B, S, 1, D]
-            structure_aligned = torch.cat([structure_aligned, score_feat], dim=2)  # [B, S, 3+3+1, D] or [B, S, 3+1, D]
-
-        # context_graph: extract k-hop head (and optionally tail) embeddings and prepend as extra tokens
-        if self.context_graph > 0:
-            hop_feats = []
-            for k in range(1, self.context_graph + 1):
-                h_k = self.structure_encoder.get_layer_output(data, all_id_triples, layer_k=k, with_relation=False)  # [B, S, D_raw]
-                h_k = self.context_graph_norm(self.context_graph_adapter(h_k))
-                hop_feats.append(h_k.unsqueeze(2))
-                if self.context_tail:
-                    t_k = self.structure_encoder.get_layer_output(data, all_id_triples, layer_k=k, with_relation=False, use_tail=True)  # [B, S, D_raw]
-                    t_k = self.context_graph_norm(self.context_graph_adapter(t_k))
-                    hop_feats.append(t_k.unsqueeze(2))
-            cg_feat = torch.cat(hop_feats, dim=2)
-            structure_aligned = torch.cat([cg_feat, structure_aligned], dim=2)
-            
+        structure_aligned = self._tokens_from_gathered(
+            h_emb, r_emb, t_emb, hops_h, hops_t, structure_scores
+        )
         return structure_aligned, context_y
 
     def forward(
@@ -531,49 +550,15 @@ class KGPFN(nn.Module):
         # 结构路
         query_structure = None
         if self.structure_encoder is not None:
-            h_emb, r_emb, t_emb = self._triples_to_embeddings(data, query_id)
-            h_emb = self.entity_adapter(h_emb)
-            r_emb = self.relation_adapter(r_emb)
-            t_emb = self.entity_adapter(t_emb)
-            query_id_feat = torch.stack([h_emb, r_emb, t_emb], dim=2)
-            query_structure = self.structure_norm(query_id_feat)
-
-            if self.enhance_structure:
-                h_s = query_structure[:, :, 0, :]
-                r_s = query_structure[:, :, 1, :]
-                t_s = query_structure[:, :, 2, :]
-                transe_feat = h_s + r_s - t_s
-                distmult_feat = h_s * r_s * t_s
-                cos_feat = (
-                    F.cosine_similarity(h_s + r_s, t_s, dim=-1, eps=1e-8)
-                    .unsqueeze(-1)
-                    .expand(-1, -1, self.hidden_dim)
-                )
-                enh_in = torch.cat([transe_feat, distmult_feat, cos_feat], dim=-1)
-                enh_delta = self.structure_enhance_adapter(enh_in).reshape(B, N, 3, self.hidden_dim)
-                enh_delta = self.structure_enhance_norm(enh_delta)
-                query_structure = torch.cat([query_structure, enh_delta], dim=2)
-
+            h_emb, r_emb, t_emb, hops_h, hops_t = self._encode_structure(data, query_id)
+            structure_scores = None
             if self.structure_score_enhance:
-                with torch.no_grad():
-                    _, t_emb_raw, _ = self.structure_encoder(data, query_id, with_relation=True)
-                    score_feat = self.structure_encoder.get_mlp_scores(t_emb_raw)
-                score_feat = self.structure_score_adapter(score_feat.unsqueeze(-1))
-                score_feat = self.structure_score_norm(score_feat).unsqueeze(2)
-                query_structure = torch.cat([query_structure, score_feat], dim=2)
-
-            if self.context_graph > 0:
-                hop_feats = []
-                for k in range(1, self.context_graph + 1):
-                    h_k = self.structure_encoder.get_layer_output(data, query_id, layer_k=k, with_relation=False)
-                    h_k = self.context_graph_norm(self.context_graph_adapter(h_k))
-                    hop_feats.append(h_k.unsqueeze(2))
-                    if self.context_tail:
-                        t_k = self.structure_encoder.get_layer_output(data, query_id, layer_k=k, with_relation=False, use_tail=True)
-                        t_k = self.context_graph_norm(self.context_graph_adapter(t_k))
-                        hop_feats.append(t_k.unsqueeze(2))
-                cg_feat = torch.cat(hop_feats, dim=2)
-                query_structure = torch.cat([cg_feat, query_structure], dim=2)
+                structure_scores = self.structure_encoder.get_mlp_scores(
+                    self._mlp_tail_embeddings(data, query_id, t_emb)
+                )
+            query_structure = self._tokens_from_gathered(
+                h_emb, r_emb, t_emb, hops_h, hops_t, structure_scores
+            )
         # 文本路
         query_text_aligned = None
         if self.semantic_encoder is not None and query_text is not None:
@@ -620,6 +605,63 @@ class KGPFN(nn.Module):
                 out = out.view(B, N, -1).squeeze(-1)
 
         return out  # [B, N]
+
+    def supports_score_all_tails(self) -> bool:
+        """``score_all_tails`` needs a structure-only model and a PFN with a row cache (TabICL)."""
+        return (
+            self.structure_encoder is not None
+            and self.semantic_encoder is None
+            and hasattr(self.feature_transformer, "encode_context_rows")
+            and (self.with_relation or not self.structure_score_enhance)
+        )
+
+    @torch.no_grad()
+    def score_all_tails(
+        self,
+        data: Any,
+        batch: torch.Tensor,
+        context_ids: List[torch.Tensor],
+        context_ys: List[torch.Tensor],
+        eval_chunk: int = 128,
+        task_type: Literal["reg", "cls"] = "reg",
+    ) -> torch.Tensor:
+        """Scores of every entity as the tail of each ``(h, r)`` query. Returns [B, |V|].
+
+        Equivalent to chunked ``get_scores`` over ``tasks.all_negative``, but runs one
+        NBFNet pass per query (all candidate tails share it) and row-encodes the
+        PFN context once instead of once per chunk.
+
+        batch: [B, 3] of (h, t_pos, r).
+        """
+        if not self.supports_score_all_tails():
+            raise RuntimeError("score_all_tails requires a structure-only TabICL model; use get_scores")
+        device = batch.device
+        B = batch.size(0)
+        cache, context_ys = self.get_context_embeddings_cache(data, context_ids, context_ys)
+        h_emb, r_emb, feat, hops_h, hops_t = self.structure_encoder.encode_all_tails(
+            data, batch, with_relation=self.with_relation, n_hop=self.context_graph
+        )
+        y_ctx = torch.stack([y.to(device).to(torch.float32) for y in context_ys], dim=0)
+        R_ctx, train_size = self.feature_transformer.encode_context_rows(cache, y_ctx)
+        del cache
+
+        V = feat.size(1)
+        step = max(1, int(eval_chunk))
+        chunks = []
+        for start in range(0, V, step):
+            end = min(start + step, V)
+            n = end - start
+            h_s = h_emb.unsqueeze(1).expand(B, n, -1)
+            r_s = r_emb.unsqueeze(1).expand(B, n, -1)
+            t_s = feat[:, start:end]
+            hop_h = [h.unsqueeze(1).expand(B, n, -1) for h in hops_h]
+            hop_t = [ht[:, start:end] for ht in hops_t]
+            query_fused = self._tokens_from_gathered(h_s, r_s, t_s, hop_h, hop_t)
+            out = self.feature_transformer.score_query_rows(query_fused, R_ctx, train_size)
+            if out.dim() == 3:
+                out = out.squeeze(-1) if out.size(-1) == 1 else out[..., 1]
+            chunks.append(out.view(B, -1))
+        return torch.cat(chunks, dim=1)
 
 
 class LabelSmoothingLoss(torch.nn.Module):

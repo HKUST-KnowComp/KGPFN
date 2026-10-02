@@ -81,6 +81,111 @@ def _nanmean(vals: list[float]) -> float:
     return sum(valid_vals) / len(valid_vals)
 
 
+EVAL_SIDES = ("head", "tail", "both")
+
+
+def _empty_side_metrics() -> dict[str, float]:
+    return {"mrr": float("nan"), "hits@10": float("nan")}
+
+
+def _empty_dataset_record(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "family": _match_dataset_family(name),
+        "head": _empty_side_metrics(),
+        "tail": _empty_side_metrics(),
+        "both": _empty_side_metrics(),
+    }
+
+
+def _side_record(side_metrics: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {
+        side: {
+            "mrr": side_metrics.get(side, {}).get("mrr", float("nan")),
+            "hits@10": side_metrics.get(side, {}).get("hits@10", float("nan")),
+        }
+        for side in EVAL_SIDES
+    }
+
+
+def _avg_side_metrics(records: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    return {
+        side: {
+            "mrr": _nanmean([r[side]["mrr"] for r in records]),
+            "hits@10": _nanmean([r[side]["hits@10"] for r in records]),
+        }
+        for side in EVAL_SIDES
+    }
+
+
+def _cat_or_empty(chunks: list[torch.Tensor], device) -> torch.Tensor:
+    if chunks:
+        return torch.cat(chunks)
+    return torch.empty(0, dtype=torch.long, device=device)
+
+
+def _gather_long_vector(local_vec: torch.Tensor, world_size: int, rank: int, device) -> torch.Tensor:
+    local_vec = local_vec.to(device=device)
+    all_size = torch.zeros(world_size, dtype=torch.long, device=device)
+    all_size[rank] = local_vec.numel()
+    if world_size > 1:
+        dist.all_reduce(all_size, op=dist.ReduceOp.SUM)
+    total = int(all_size.sum().item())
+    gathered = torch.zeros(total, dtype=local_vec.dtype, device=device)
+    if local_vec.numel() > 0:
+        end = int(all_size.cumsum(0)[rank].item())
+        start = end - int(all_size[rank].item())
+        gathered[start:end] = local_vec
+    if world_size > 1 and total > 0:
+        dist.all_reduce(gathered, op=dist.ReduceOp.SUM)
+    return gathered
+
+
+def _ranking_metrics(
+    all_ranking: torch.Tensor,
+    all_num_negative: torch.Tensor,
+    metric_names: list[str],
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if all_ranking.numel() == 0:
+        for metric in metric_names:
+            if metric in ("precision", "recall", "f1"):
+                continue
+            out[metric] = float("nan")
+        out.setdefault("mrr", float("nan"))
+        out.setdefault("hits@10", float("nan"))
+        return out
+
+    ranking_f = all_ranking.float()
+    for metric in metric_names:
+        if metric == "mr":
+            score = ranking_f.mean()
+        elif metric == "mrr":
+            score = (1 / ranking_f).mean()
+        elif metric in ("precision", "recall", "f1"):
+            continue
+        elif metric.startswith("hits@"):
+            values = metric[5:].split("_")
+            threshold = int(values[0])
+            if len(values) > 1:
+                num_sample = int(values[1])
+                fp_rate = (all_ranking - 1).float() / all_num_negative
+                score = 0
+                for i in range(threshold):
+                    num_comb = math.factorial(num_sample - 1) / \
+                            math.factorial(i) / math.factorial(num_sample - i - 1)
+                    score += num_comb * (fp_rate ** i) * ((1 - fp_rate) ** (num_sample - i - 1))
+                score = score.mean()
+            else:
+                score = (ranking_f <= threshold).float().mean()
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+        out[metric] = float(score.item())
+    out.setdefault("mrr", float((1 / ranking_f).mean().item()))
+    out.setdefault("hits@10", float((ranking_f <= 10).float().mean().item()))
+    return out
+
+
 def _get_dataset_csv_path(cfg, split: str) -> str:
     csv_name = f"metrics.csv"
     checkpoint_dir = cfg.train.get("checkpoint_dir", ".")
@@ -89,16 +194,24 @@ def _get_dataset_csv_path(cfg, split: str) -> str:
     return os.path.join(csv_dir, csv_name)
 
 
+def _write_side_block(rows: list[list[str]], name: str, rec: dict[str, Any]) -> None:
+    first = True
+    for side in EVAL_SIDES:
+        label = name if first else ""
+        first = False
+        rows.append([label, side, "mrr", _format_metric(rec[side]["mrr"])])
+        rows.append(["", "", "hit10", _format_metric(rec[side]["hits@10"])])
+
+
 def _write_dataset_csv(
     csv_path: str,
-    dataset_records: list[tuple[str, float, float, str]],
+    dataset_records: list[dict[str, Any]],
 ):
 
     rows: list[list[str]] = []
-    for ds_name, mrr, hit10, _ in dataset_records:
-        rows.append([ds_name, "mrr", _format_metric(mrr)])
-        rows.append(["", "hit10", _format_metric(hit10)])
-        rows.append(["", "", ""])
+    for rec in dataset_records:
+        _write_side_block(rows, rec["name"], rec)
+        rows.append(["", "", "", ""])
 
     group_specs = [
         ("transductive_average", "transductive"),
@@ -106,13 +219,10 @@ def _write_dataset_csv(
         ("full_inductive_average", "full_inductive"),
     ]
     for idx, (label, group_name) in enumerate(group_specs):
-        selected = [r for r in dataset_records if r[3] == group_name]
-        avg_mrr = _nanmean([r[1] for r in selected])
-        avg_hit10 = _nanmean([r[2] for r in selected])
-        rows.append([label, "mrr", _format_metric(avg_mrr)])
-        rows.append(["", "hit10", _format_metric(avg_hit10)])
+        selected = [r for r in dataset_records if r["family"] == group_name]
+        _write_side_block(rows, label, _avg_side_metrics(selected))
         if idx != len(group_specs) - 1:
-            rows.append(["", "", ""])
+            rows.append(["", "", "", ""])
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -204,12 +314,61 @@ def _build_model_inputs(query_ids: torch.Tensor, context_ids: list[torch.Tensor]
     return {"id": query_ids, "text": query_text}, {"id": context_ids, "text": context_text}
 
 
+def _score_all_candidate_tails(model, graph, eval_batch, context_ids, context_ys, eval_chunk_size: int) -> torch.Tensor:
+    """[B, |V|] scores of every entity as the tail of each ``(h, r)`` row of ``eval_batch``.
+
+    Structure-only TabICL models use the cached single-pass ``score_all_tails``;
+    otherwise ``tasks.all_negative`` is scored in chunks through ``get_scores``,
+    with text when the semantic encoder is on.
+    """
+    if model.supports_score_all_tails():
+        return model.score_all_tails(
+            graph, eval_batch, context_ids, context_ys, eval_chunk=eval_chunk_size, task_type="reg",
+        )
+    use_text = _semantic_enabled(model)
+    t_batch, _ = tasks.all_negative(graph, eval_batch)
+    batch_size, num_nodes, _ = t_batch.shape
+    context_texts = None
+    if use_text:
+        _, context_pack = _build_model_inputs(eval_batch.unsqueeze(1), context_ids, graph, enable_text=True)
+        context_texts = context_pack["text"]
+    context_cache, context_ys = model.get_context_embeddings_cache(graph, context_ids, context_ys, context_texts)
+    step = max(1, int(eval_chunk_size))
+    chunks = []
+    for start in range(0, num_nodes, step):
+        query_x, _ = _build_model_inputs(t_batch[:, start:start + step, :], context_ids, graph, enable_text=use_text)
+        scores = model.get_scores(
+            graph,
+            query_x=query_x,
+            context_cache=context_cache,
+            context_y=context_ys,
+            task_type="reg",
+        )
+        chunks.append(scores.view(batch_size, -1))
+    return torch.cat(chunks, dim=1)
+
+
 def _get_context_sampling_args(cfg):
     # relation-aware context builder currently only needs pos/neg counts.
     return {
         "num_pos": int(cfg.task.num_pos),
         "num_neg": int(cfg.task.num_neg),
     }
+
+
+def _subsample_targets(graphs, n):
+    """Copy of each graph keeping at most ``n`` target triples. Observed edges stay intact."""
+    n = int(n)
+    out = []
+    for graph in graphs:
+        sampled = copy.deepcopy(graph)
+        n_edges = sampled.target_edge_index.shape[1]
+        if n_edges > n:
+            mask = torch.randperm(n_edges)[:n]
+            sampled.target_edge_index = sampled.target_edge_index[:, mask]
+            sampled.target_edge_type = sampled.target_edge_type[mask]
+        out.append(sampled)
+    return out
 
 
 def _get_project_root():
@@ -492,9 +651,17 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
     adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
     loss_weights = list(cfg.task.get("loss_weights", [1.0, 0.0]))  # [lambda_bce, lambda_softmax]
     label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
+    # 每条三元组额外训练一条 (t, r^-1, ?) 反向 query，实际 batch 变为 2 倍
+    train_inverse = bool(cfg.task.get("train_inverse", True))
     use_wandb = bool(cfg.train.get("use_wandb", False))
     valid_eval_step_interval = int(cfg.train.get("valid_eval_step_interval", 0))
     best_mrr = -1.0  # 用于保存 MRR 最优的 checkpoint
+
+    if is_main and train_inverse:
+        logger.warning(
+            "Bidirectional training enabled: effective batch size %d (%d forward + %d inverse queries)",
+            cfg.train.batch_size * 2, cfg.train.batch_size, cfg.train.batch_size,
+        )
 
     batch_id = 0
     for i in range(0, cfg.train.num_epoch, step):
@@ -525,6 +692,10 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None, b
                     train_graph.target_edge_index[:, perm],
                     train_graph.target_edge_type[perm].unsqueeze(0),
                 ]).t()
+
+                # 0) 每条三元组配一条反向 query，让 head / tail 两侧共享同一次更新
+                if train_inverse:
+                    batch = tasks.augment_with_inverse_queries(train_graph, batch)
 
                 # 1) 负采样得到 (B, N, 3) 的 query 三元组
                 batch_with_neg = tasks.negative_sampling_tail(
@@ -717,23 +888,28 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
     loss_weights = list(cfg.task.get("loss_weights", [1.0, 0.0]))
     adversarial_temperature = float(cfg.task.get("adversarial_temperature", 0.0))
     label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
-    
+
+    def _mrr(ranking):
+        return float((1.0 / ranking.float()).mean().item()) if ranking.numel() else float("nan")
+
+    def _hits(ranking, k):
+        return float((ranking <= k).float().mean().item()) if ranking.numel() else float("nan")
+
     # test_data is a tuple of validation/test datasets
     # process sequentially
     all_metrics: list[float] = []
     collected_metric_values: dict[str, list[float]] = {}
-    dataset_records: list[tuple[str, float, float, str]] = []
-    default_num_neg = int(cfg.task.num_neg)
-    for graph_idx, test_graph in enumerate(test_data):
-        graph_name = getattr(test_graph, "dataset", f"graph_{graph_idx}")
-        dataset_records.append((graph_name, float("nan"), float("nan"), _match_dataset_family(graph_name)))
-
+    dataset_records = [
+        _empty_dataset_record(getattr(g, "dataset", f"graph_{i}")) for i, g in enumerate(test_data)
+    ]
     csv_path = _get_dataset_csv_path(cfg, split)
     if rank == 0:
         # 先按当前评测数据集创建 CSV，后续每个数据集完成后实时覆盖更新
         _write_dataset_csv(csv_path, dataset_records)
         logger.warning("Per-dataset csv initialized at %s", csv_path)
-
+    if filtered_data is None:
+        filtered_data = [None] * len(test_data)
+    default_num_neg = int(cfg.task.num_neg)
     for graph_idx, (test_graph, filters) in enumerate(zip(test_data, filtered_data)):
         graph_name = getattr(test_graph, "dataset", f"graph_{graph_idx}")
         is_nell_inductive_v1 = graph_name == "NELLInductive-v1"
@@ -752,35 +928,29 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
         test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
 
         model.eval()
-        rankings = []
-        num_negatives = []
-        # classification-style metrics（基于 logit 阈值）
+        tail_rankings, head_rankings = [], []
+        tail_num_negatives, head_num_negatives = [], []
+        # classification-style metrics（基于 logit 阈值，both 汇总）
         tp_total = torch.zeros(1, dtype=torch.float32, device=device)
         fp_total = torch.zeros(1, dtype=torch.float32, device=device)
         fn_total = torch.zeros(1, dtype=torch.float32, device=device)
         eval_losses, eval_bce_losses, eval_softmax_losses = [], [], []
         for batch in test_loader:
-            # Evaluate the original query and its tail-side inverse query.
+            # 原始 query (h, r, ?) 预测 tail；反向 query (t, r^-1, ?) 预测 head。
+            # 两组都枚举全部候选 tail；tail-only 数据集没有反向 query。
             reverse_batch = tasks.inverse_relation_queries(test_graph, batch)
             eval_batch = torch.cat([batch, reverse_batch], dim=0)
+            n_tail = int(batch.size(0))
 
-            # 1) 严格负采样评测：两组 query 都枚举全部候选 tail。
-            t_batch, _ = tasks.all_negative(test_graph, eval_batch)
-            B, num_nodes, _ = t_batch.shape
+            t_mask, _ = tasks.strict_negative_mask(test_graph if filters is None else filters, eval_batch)
+            pos_t_index = eval_batch[:, 1]
 
-            if filtered_data is None:
-                t_mask, h_mask = tasks.strict_negative_mask(test_graph, eval_batch)
-            else:
-                t_mask, h_mask = tasks.strict_negative_mask(filters, eval_batch)
-            pos_h_index, pos_t_index, pos_r_index = eval_batch.t()
-
-            # 2) 对每个 batch 行只构建一次上下文，在多个 chunk 间复用
-            # build_context_for_batch 期望 [B, N, 3]，这里用 N=1 的锚点 query
-            row_anchor_batch = eval_batch.unsqueeze(1)
+            # 1) 对每个 batch 行只构建一次上下文，在全部候选 tail 间复用
+            # build_context_relation_aware 期望 [B, N, 3]，这里用 N=1 的锚点 query
             try:
                 shared_context_x, shared_context_y = tasks.build_context_relation_aware(
                     test_graph,
-                    row_anchor_batch,
+                    eval_batch.unsqueeze(1),
                     num_pos=cfg.task.num_pos,
                     num_neg=cfg.task.num_neg,
                 )  # 长度为 B
@@ -790,25 +960,10 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
             shared_context_x = [t.to(device) for t in shared_context_x]
             shared_context_y = [y.to(device) for y in shared_context_y]
 
-            # 3) 预计算上下文 embedding cache，同时获取（可能修正的）标签
-            context_cache, shared_context_y = model.get_context_embeddings_cache(
-                test_graph, shared_context_x, shared_context_y,
+            # 2) 所有候选 tail 的分数 (B, num_nodes)
+            t_pred = _score_all_candidate_tails(
+                model, test_graph, eval_batch, shared_context_x, shared_context_y, eval_chunk_size,
             )
-
-            # 4) 分 chunk 评测所有 tail 候选
-            t_score_chunks = []
-            for start in range(0, num_nodes, max(1, eval_chunk_size)):
-                end = min(start + max(1, eval_chunk_size), num_nodes)
-                t_batch_chunk = t_batch[:, start:end, :]  # (B, chunk, 3)
-                t_scores_chunk = model.get_scores(
-                    test_graph,
-                    query_x=t_batch_chunk.to(device),
-                    context_cache=context_cache,
-                    context_y=shared_context_y,
-                    task_type="reg",
-                )
-                t_score_chunks.append(t_scores_chunk.view(B, -1))
-            t_pred = torch.cat(t_score_chunks, dim=1)  # (B, num_nodes)
 
             # compute loss on full candidate set
             eval_loss = torch.tensor(0.0, device=t_pred.device)
@@ -832,21 +987,21 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
                 eval_bce_loss = ((loss_raw * weight).sum(dim=-1) / weight.sum(dim=-1)).mean()
                 eval_loss = eval_loss + loss_weights[0] * eval_bce_loss
             if loss_weights[1] > 0:
-
                 eval_softmax_loss = F.cross_entropy(t_pred.float(), pos_t_index.to(t_pred.device), label_smoothing=label_smoothing)
                 eval_loss = eval_loss + loss_weights[1] * eval_softmax_loss
             eval_losses.append(eval_loss.item())
             eval_bce_losses.append(eval_bce_loss.item())
             eval_softmax_losses.append(eval_softmax_loss.item())
 
-            # 4) ranking（原始 tail + 反向 relation 的 head，合并汇总）
+            # 3) ranking：前 n_tail 行是 tail，后面是反向 relation 的 head
             t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
             num_t_negative = t_mask.sum(dim=-1)
+            tail_rankings.append(t_ranking[:n_tail])
+            tail_num_negatives.append(num_t_negative[:n_tail])
+            head_rankings.append(t_ranking[n_tail:])
+            head_num_negatives.append(num_t_negative[n_tail:])
 
-            rankings += [t_ranking]
-            num_negatives += [num_t_negative]
-
-            # 5) 计算 precision/recall/f1（只在 filtered 可比较集合内）
+            # 4) 计算 precision/recall/f1（只在 filtered 可比较集合内）
             valid_mask = t_mask.clone()
             valid_mask.scatter_(1, pos_t_index.unsqueeze(-1), True)  # 把正例位加入评估
             pred_pos = t_pred > score_threshold
@@ -862,117 +1017,88 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
             fp_total += fp
             fn_total += fn
 
-            # 6) 周期性进度日志（防止验证过慢无反馈）
-            if rank == 0 and (len(rankings) % max(1, eval_log_interval) == 0):
-                cur_ranking = torch.cat(rankings)
-                cur_mrr = (1.0 / cur_ranking.float()).mean()
-                cur_hits1 = (cur_ranking <= 1).float().mean()
-                cur_hits3 = (cur_ranking <= 3).float().mean()
-                cur_hits10 = (cur_ranking <= 10).float().mean()
-                cur_hits30 = (cur_ranking <= 30).float().mean()
+            # 5) 周期性进度日志（防止验证过慢无反馈）
+            if rank == 0 and (len(tail_rankings) % max(1, eval_log_interval) == 0):
+                cur_tail = torch.cat(tail_rankings)
+                cur_head = torch.cat(head_rankings)
+                cur_both = torch.cat([cur_tail, cur_head])
                 cur_precision = tp_total / (tp_total + fp_total + 1e-12)
                 cur_recall = tp_total / (tp_total + fn_total + 1e-12)
                 cur_f1 = 2 * cur_precision * cur_recall / (cur_precision + cur_recall + 1e-12)
                 logger.warning(
-                    "[eval-progress] steps=%d mrr=%.6f hits@1=%.6f hits@3=%.6f hits@10=%.6f hits@30=%.6f precision=%.6f recall=%.6f f1=%.6f",
-                    len(rankings),
-                    cur_mrr.item(),
-                    cur_hits1.item(),
-                    cur_hits3.item(),
-                    cur_hits10.item(),
-                    cur_hits30.item(),
+                    "[eval-progress] steps=%d both_mrr=%.6f tail_mrr=%.6f head_mrr=%.6f "
+                    "hits@1=%.6f hits@3=%.6f hits@10=%.6f precision=%.6f recall=%.6f f1=%.6f",
+                    len(tail_rankings),
+                    _mrr(cur_both), _mrr(cur_tail), _mrr(cur_head),
+                    _hits(cur_both, 1), _hits(cur_both, 3), _hits(cur_both, 10),
                     cur_precision.item(),
                     cur_recall.item(),
                     cur_f1.item(),
                 )
 
-        if rankings:
-            ranking = torch.cat(rankings)
-            num_negative = torch.cat(num_negatives)
-        else:
-            ranking = torch.empty(0, dtype=torch.long, device=device)
-            num_negative = torch.empty(0, dtype=torch.long, device=device)
-        all_size = torch.zeros(world_size, dtype=torch.long, device=device)
-        all_size[rank] = len(ranking)
-        if world_size > 1:
-            dist.all_reduce(all_size, op=dist.ReduceOp.SUM)
-        if all_size.sum().item() == 0:
+        all_tail_ranking = _gather_long_vector(_cat_or_empty(tail_rankings, device), world_size, rank, device)
+        all_head_ranking = _gather_long_vector(_cat_or_empty(head_rankings, device), world_size, rank, device)
+        all_tail_num_negative = _gather_long_vector(_cat_or_empty(tail_num_negatives, device), world_size, rank, device)
+        all_head_num_negative = _gather_long_vector(_cat_or_empty(head_num_negatives, device), world_size, rank, device)
+        all_ranking = torch.cat([all_tail_ranking, all_head_ranking])
+        all_num_negative = torch.cat([all_tail_num_negative, all_head_num_negative])
+        if all_ranking.numel() == 0:
             if rank == 0:
                 logger.warning("[%s] No valid ranking generated; skip this dataset.", graph_name)
             continue
-        cum_size = all_size.cumsum(0)
-        all_ranking = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-        all_ranking[cum_size[rank] - all_size[rank]: cum_size[rank]] = ranking
-        all_num_negative = torch.zeros(all_size.sum(), dtype=torch.long, device=device)
-        all_num_negative[cum_size[rank] - all_size[rank]: cum_size[rank]] = num_negative
         if world_size > 1:
-            dist.all_reduce(all_ranking, op=dist.ReduceOp.SUM)
-            dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
             dist.all_reduce(tp_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(fp_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(fn_total, op=dist.ReduceOp.SUM)
 
-        graph_metrics: dict[str, float] = {}
+        side_rankings = {
+            "head": (all_head_ranking, all_head_num_negative),
+            "tail": (all_tail_ranking, all_tail_num_negative),
+            "both": (all_ranking, all_num_negative),
+        }
+        side_metrics = {
+            side: _ranking_metrics(ranking, num_neg, list(cfg.task.metric))
+            for side, (ranking, num_neg) in side_rankings.items()
+        }
+
         if rank == 0:
             precision = tp_total / (tp_total + fp_total + 1e-12)
             recall = tp_total / (tp_total + fn_total + 1e-12)
             f1 = 2 * precision * recall / (precision + recall + 1e-12)
-            for metric in cfg.task.metric:
-                if metric == "mr":
-                    score = all_ranking.float().mean()
-                elif metric == "mrr":
-                    score = (1 / all_ranking.float()).mean()
-                elif metric == "precision":
-                    score = precision
-                elif metric == "recall":
-                    score = recall
-                elif metric == "f1":
-                    score = f1
-                elif metric.startswith("hits@"):
-                    values = metric[5:].split("_")
-                    threshold = int(values[0])
-                    if len(values) > 1:
-                        num_sample = int(values[1])
-                        # unbiased estimation
-                        fp_rate = (all_ranking - 1).float() / all_num_negative
-                        score = 0
-                        for i in range(threshold):
-                            # choose i false positive from num_sample - 1 negatives
-                            num_comb = math.factorial(num_sample - 1) / \
-                                    math.factorial(i) / math.factorial(num_sample - i - 1)
-                            score += num_comb * (fp_rate ** i) * ((1 - fp_rate) ** (num_sample - i - 1))
-                        score = score.mean()
-                    else:
-                        score = (all_ranking <= threshold).float().mean()
-                else:
-                    raise ValueError(f"Unknown metric: {metric}")
-                logger.warning("[%s] %s: %g", graph_name, metric, score)
-                graph_metrics[metric] = float(score.item())
-            avg_eval_loss = sum(eval_losses) / len(eval_losses)
-            avg_eval_bce = sum(eval_bce_losses) / len(eval_bce_losses)
-            avg_eval_softmax = sum(eval_softmax_losses) / len(eval_softmax_losses)
+            side_metrics["both"].update({
+                "precision": float(precision.item()),
+                "recall": float(recall.item()),
+                "f1": float(f1.item()),
+            })
+            for side in EVAL_SIDES:
+                ranking, _ = side_rankings[side]
+                if ranking.numel() == 0:
+                    logger.warning("[%s][%s] skipped (no queries on this side)", graph_name, side)
+                    continue
+                metrics = side_metrics[side]
+                for metric in cfg.task.metric:
+                    if metric in metrics:
+                        logger.warning("[%s][%s] %s: %g", graph_name, side, metric, metrics[metric])
             logger.warning("[%s] loss: %g, bce_loss: %g, softmax_loss: %g",
-                           graph_name, avg_eval_loss, avg_eval_bce, avg_eval_softmax)
-        mrr = (1 / all_ranking.float()).mean()
-        hit10 = (all_ranking <= 10).float().mean()
+                           graph_name, _nanmean(eval_losses), _nanmean(eval_bce_losses), _nanmean(eval_softmax_losses))
 
-        mrr_value = float(mrr.item())
+        # 模型选择只看 both 侧的 mrr
+        mrr_value = side_metrics["both"]["mrr"]
         if not math.isnan(mrr_value):
             all_metrics.append(mrr_value)
         if rank == 0:
-            graph_metrics["mrr"] = mrr_value
-            logger.warning("[%s] mrr: %g", graph_name, graph_metrics["mrr"])
-            graph_metrics["hits@10"] = float(hit10.item())
-            logger.warning("[%s] hits@10: %g", graph_name, graph_metrics["hits@10"])
-            dataset_records[graph_idx] = (
-                graph_name,
-                graph_metrics["mrr"],
-                graph_metrics["hits@10"],
-                _match_dataset_family(graph_name),
-            )
+            logger.warning("[%s] mrr(both): %g | mrr(tail): %g | mrr(head): %g",
+                           graph_name, mrr_value,
+                           side_metrics["tail"]["mrr"], side_metrics["head"]["mrr"])
+            dataset_records[graph_idx] = {
+                "name": graph_name,
+                "family": _match_dataset_family(graph_name),
+                **_side_record(side_metrics),
+            }
             _write_dataset_csv(csv_path, dataset_records)
-            for k, v in graph_metrics.items():
-                collected_metric_values.setdefault(k, []).append(v)
+            for side, metrics in side_metrics.items():
+                for k, v in metrics.items():
+                    collected_metric_values.setdefault(f"{k}_{side}", []).append(v)
 
     if not all_metrics:
         if rank == 0:
@@ -980,16 +1106,23 @@ def test(cfg, model, test_data, filtered_data=None, split: str = "valid"):
         avg_metric = torch.tensor(float("nan"), device=device)
     else:
         avg_metric = torch.tensor(_nanmean(all_metrics), device=device)
+    if rank == 0:
+        # 跨数据集平均：三侧分开汇报，返回值取 both
+        for side in EVAL_SIDES:
+            logger.warning(
+                "[%s][%s] average mrr: %g, average hits@10: %g",
+                split, side,
+                _nanmean([r[side]["mrr"] for r in dataset_records]),
+                _nanmean([r[side]["hits@10"] for r in dataset_records]),
+            )
+        _write_dataset_csv(csv_path, dataset_records)
+        logger.warning("Per-dataset csv saved to %s", csv_path)
     if rank == 0 and wandb is not None and wandb.run is not None and collected_metric_values:
         # 记录每次完整评测后的平均指标到 summary
         for metric_name, values in collected_metric_values.items():
             wandb.run.summary[f"{split}/{metric_name}_avg"] = float(_nanmean(values))
         wandb.run.summary[f"{split}/mrr_return"] = float(avg_metric.item())
-    if rank == 0:
-        _write_dataset_csv(csv_path, dataset_records)
-        logger.warning("Per-dataset csv saved to %s", csv_path)
     return avg_metric
-
 
 if __name__ == "__main__":
     args, vars = util.parse_args()
@@ -1055,23 +1188,19 @@ if __name__ == "__main__":
     dataset = util.build_dataset(cfg)
     device = accelerator.device if accelerator is not None else util.get_device(cfg)
     
-    # train_data, valid_data, test_data = dataset._data[0], dataset._data[1], dataset._data[2]
+    # Swap official valid and test. `valid_data` is the official test split and is what the
+    # final eval scores. `test_data` is official valid and is what checkpointing uses.
+    # fast_test only subsamples that official test eval.
     train_data, test_data, valid_data = dataset._data[0], dataset._data[1], dataset._data[2]
-    if "fast_test" in cfg.train:
-        num_val_edges = cfg.train.fast_test
-        if util.get_rank() == 0:
-            logger.warning(f"Fast evaluation on {num_val_edges} samples in validation")
-        short_valid = [copy.deepcopy(vd) for vd in valid_data]
-        for graph in short_valid:
-            mask = torch.randperm(graph.target_edge_index.shape[1])[:num_val_edges]
-            graph.target_edge_index = graph.target_edge_index[:, mask]
-            graph.target_edge_type = graph.target_edge_type[mask]
-        
-        short_valid = [sv.to(device) for sv in short_valid]
-
     train_data = [td.to(device) for td in train_data]
     valid_data = [vd.to(device) for vd in valid_data]
     test_data = [tst.to(device) for tst in test_data]
+    if "fast_test" in cfg.train:
+        eval_test = _subsample_targets(valid_data, cfg.train.fast_test)
+        if util.get_rank() == 0:
+            logger.warning("Fast test: %d target triples per graph of the official test split", int(cfg.train.fast_test))
+    else:
+        eval_test = valid_data
 
     model = create_model(
         cfg,
@@ -1092,21 +1221,15 @@ if __name__ == "__main__":
     #   - Inductive: test entities differ from train entities; using test_graph.num_nodes
     #     fixes the shape mismatch (test_graph.num_nodes != train_graph.num_nodes) that
     #     caused compute_ranking to crash with mismatched tensor dimensions.
-    def _make_filtered_data(graphs):
-        filtered = []
-        for g in graphs:
-            inverse_target_index = g.target_edge_index.flip(0)
-            inverse_target_type = g.target_edge_type + g.num_relations // 2
-            filtered.append(Data(
-                edge_index=torch.cat([
-                    g.edge_index, g.target_edge_index, inverse_target_index
-                ], dim=1),
-                edge_type=torch.cat([
-                    g.edge_type, g.target_edge_type, inverse_target_type
-                ]),
-                num_nodes=g.num_nodes,
-            ).to(device))
-        return filtered
+    # Filtered ranking excludes every known fact: the eval graph's observed edges plus the
+    # train / valid / test targets (and their inverses).
+    def _make_filtered_data(eval_graphs):
+        return [
+            tasks.make_filtered_ranking_graph(
+                g, train_data[i], valid_data[i], test_data[i]
+            ).to(device)
+            for i, g in enumerate(eval_graphs)
+        ]
 
     valid_filtered_data = _make_filtered_data(valid_data)
     test_filtered_data = _make_filtered_data(test_data)
@@ -1116,7 +1239,7 @@ if __name__ == "__main__":
     if not os.path.isabs(ckpt_dir):
         cfg.train.checkpoint_dir = os.path.join(working_dir, ckpt_dir)
 
-    train_and_validate(cfg, model, train_data, valid_data if "fast_test" not in cfg.train else short_valid, filtered_data=valid_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
+    train_and_validate(cfg, model, train_data, test_data, filtered_data=test_filtered_data, batch_per_epoch=cfg.train.batch_per_epoch, accelerator=accelerator)
     
 
     # if util.get_rank() == 0:
@@ -1128,6 +1251,6 @@ if __name__ == "__main__":
     #     logger.warning("Evaluate on test")
 
     # test(cfg, model, test_data, filtered_data=test_filtered_data, split="test")
-    test(cfg, model, short_valid, filtered_data=valid_filtered_data, split="test")
+    test(cfg, model, eval_test, filtered_data=valid_filtered_data, split="test")
     if util.get_rank() == 0 and use_wandb and wandb is not None:
         wandb.finish()

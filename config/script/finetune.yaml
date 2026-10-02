@@ -1,13 +1,16 @@
 output_dir: ./output
-model_config_path: null # null, ./config/kgpfn/{model_name}.yaml
+model_config_path: null
 
 dataset:
   class: JointDataset
-  graphs: all
+  # the dataset(s) to finetune on
+  graphs: [CoDExMedium]
   root: ./kg-datasets/
 
 model:
   class: KGPFN
+  # The model section must match kgpfn_checkpoint: weights are loaded with strict=False,
+  # so mismatched modules are silently left at their initialization.
   # Set to "none" / "null" to disable structure encoder, use semantic encoder only
   structure_encoder: True
   enhance_structure: True
@@ -54,46 +57,62 @@ task:
   # also train each triple as a (t, r^-1, ?) query; doubles the effective batch size
   train_inverse: yes
   # full-graph batches drop their B positives and B inverse edges from the observed graph
+  # (forced on when train.finetune_mode is full)
   mask_query_edges: True
   # [tail, head]: average each side first, then combine by these weights
   side_loss_weights: [1.0, 1.0]
   context_label_correction: True
-  # Support/query episodes, sampled online during training (pfn/episode.py): each original
-  # relation keeps a rho fraction of its train edges as the support graph (inverses added,
-  # largest connected component only); the remaining edges inside it are the query pool.
-  # A new split is drawn every steps_per_episode steps. A graph whose split fails
-  # resample_retries times falls back to full-graph training with mask_query_edges.
+  # Online support/query split used by stage 2 when train.finetune_mode is episode
+  # (`enabled` is overridden by finetune_mode). See config/script/train_all.yaml.
   episode:
     enabled: true
-    rho: [0.5, 0.9]
+    rho: [0.8, 0.9]
     rho_jitter: 0.08
     steps_per_episode: 10
     max_retries: 8
     resample_retries: 3
-  
 
 optimizer:
   class: AdamW
-  lr: 5.0e-5
-  weight_decay: 1.0e-5            # none / null: disable weight_decay (converted to 0.0 in script)
+  lr: 5.0e-5                      # default lr; each stage can override it (structure_encoder_lr / pfn_lr)
+  weight_decay: 1.0e-6            # none / null: disable weight_decay (converted to 0.0 in script)
 train:
   # train params
   gpus: {{ gpus }}
-  batch_size: 64
-  num_epoch: 50
+  batch_size: 32
+  num_epoch: 0                    # unused by the two-stage schedule below
   log_interval: 25
   batch_per_epoch: 100
-  valid_eval_step_interval: 500
- 
-  # eval params
-  # subsample of the official test split, used only by the test eval (not for checkpointing)
-  fast_test: 256
-  eval_chunk_size: 256
+  valid_eval_step_interval: 100   # evaluate on valid (and refresh model_best.pth) every N steps; 0 = never
 
-  # log params (defaults to working_dir/pretrain_pfn.log when log_file is not configured)
+  # ── Stage 1: train only the structure encoder (adapters + PFN frozen) ──
+  # Uses ULTRA's own link-prediction loss on the 1+num_negative candidates instead of
+  # backpropagating through the frozen PFN, which would keep a [num_nodes, D] activation
+  # per context (h, r) pair and never train the ULTRA MLP score head. Always trains on
+  # the full train graph; EntityNBFNet drops each batch's query edges itself in training
+  # mode. Single-process only (set structure_encoder_epoch: 0 for multi-GPU runs).
+  structure_encoder_epoch: 5
+  structure_encoder_lr: 1.0e-5    # null: use optimizer.lr
+  # null = one full pass over the train set per epoch; otherwise this many random batches.
+  # Falls back to batch_per_epoch when omitted.
+  structure_encoder_batch_per_epoch: 100
+
+  # ── Stage 2: freeze the structure encoder, train adapters + PFN ──
+  pfn_epoch: 20
+  pfn_lr: 5.0e-5                  # null: use optimizer.lr
+  #   episode = online support/query splits with the ratios in task.episode
+  #   full    = whole train graph, mask_query_edges removes each batch's edges
+  finetune_mode: full             # episode | full
+
+  # eval params
+  # subsample of the official test split for the final test eval; checkpointing uses full valid
+  fast_test: 256
+  eval_chunk_size: 128
+  skip_final_test: false          # true: skip evaluating model_best.pth on the test split
+
+  # log params (defaults to working_dir/finetune.log when log_file is not configured)
   max_checkpoints: 10  # Max number of step checkpoints to keep (model_best is always kept)
   checkpoint_dir: ./checkpoints/
-  train_structure_encoder: false
   inverse_relation_semantic_mode: text
 
   # init model paths
@@ -107,9 +126,11 @@ train:
   tabicl_config_path: ./config/tabicl/tabicl.yaml
   tabicl_ckpt_path: ./cache/tabicl-regressor-v2-20260212.ckpt  # or classifier ckpt
 
-  kgpfn_checkpoint: null #null ,ckpt path
-  
+  # pretrained KGPFN to finetune (highest priority, overrides the init above),
+  # e.g. ./cache/kgpfn_icl.pth from `python script/download.py --kgpfn`
+  kgpfn_checkpoint: null
+
   # wandb logging
   use_wandb: false  # Set to false to disable wandb
   wandb_api_key: <your wandb api key>
-  wandb_project: kgpfn
+  wandb_project: kgpfn-finetune

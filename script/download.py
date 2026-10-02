@@ -6,7 +6,8 @@ Usage:
   python script/download.py --ultra 3g               # ultra_3g
   python script/download.py --ft limix               # limix instead of tabicl
   python script/download.py --ckpt_dir ./ckpts --cache_dir ./cache
-  python script/download.py --kgpfn                  # kgpfn_icl.pth (default)
+  python script/download.py --kgpfn                  # kgpfn_icl_all.pth (default)
+  python script/download.py --kgpfn icl_3g           # kgpfn_icl_3g.pth
   python script/download.py --kgpfn limix            # kgpfn_limix.pth
   python script/download.py --kgpfn iclsemantic      # kgpfn_iclsemantic.pth
 """
@@ -71,7 +72,8 @@ def download_limix(cache_dir: str) -> str:
 
 
 KGPFN_VARIANTS = {
-    "icl":         "kgpfn_icl.pth",
+    "icl_all":     "kgpfn_icl_all.pth",
+    "icl_3g":      "kgpfn_icl_3g.pth",
     "limix":       "kgpfn_limix.pth",
     "iclsemantic": "kgpfn_iclsemantic.pth",
 }
@@ -92,8 +94,8 @@ def main():
     parser.add_argument("--ft", choices=["tabicl", "limix"], default="tabicl",
                         help="Feature transformer to download")
     parser.add_argument("--kgpfn", choices=list(KGPFN_VARIANTS.keys()), nargs="?",
-                        const="icl", default=None,
-                        help="Download a trained KGPFN model (default: icl)")
+                        const="icl_all", default=None,
+                        help="Download a trained KGPFN model (default: icl_all)")
     parser.add_argument("--cache_dir", default="./cache")
     args = parser.parse_args()
 

@@ -51,6 +51,8 @@ task:
   loss_weights: [1.0, 1.0]
   # label_smoothing: only used for softmax loss; 0.0 = no smoothing
   label_smoothing: 0.1
+  # also train each triple as a (t, r^-1, ?) query; doubles the effective batch size
+  train_inverse: yes
   context_label_correction: True
   
 
@@ -68,6 +70,7 @@ train:
   valid_eval_step_interval: 500
  
   # eval params
+  # subsample of the official test split; delete this key to score the full test set
   fast_test: 256
   eval_chunk_size: 256
 

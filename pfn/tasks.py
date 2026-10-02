@@ -1,3 +1,4 @@
+import copy
 from functools import reduce
 from typing import Dict
 import numpy as np
@@ -165,6 +166,93 @@ def inverse_relation_queries(data, batch):
     return torch.stack([t_index, h_index, inverse_r], dim=-1)
 
 
+def augment_with_inverse_queries(data, batch):
+    """Pair every ``[B, 3]`` row with its inverse query, returning ``[2B, 3]``.
+
+    Row ``i + B`` is the head-side counterpart of row ``i``: predicting the tail
+    of ``(t, r^-1, ?)`` recovers the original head. Tail-only datasets keep their
+    ``[B, 3]`` shape because ``inverse_relation_queries`` yields no rows for them.
+    """
+    if batch.numel() == 0:
+        return batch
+    reverse_batch = inverse_relation_queries(data, batch)
+    if reverse_batch.numel() == 0:
+        return batch
+    return torch.cat([batch, reverse_batch], dim=0)
+
+
+def mask_query_edges(data, batch):
+    """Drop the batch's positive edges and their inverses from the observed graph.
+
+    For a batch of B triples this removes up to 2B directed edges: each ``(h, r, t)``
+    and the matching ``(t, r^{-1}, h)``. Context positives and other train facts stay.
+    The original ``data`` is not mutated.
+
+    ``batch`` is ``[B, 3]`` or ``[B, N, 3]`` (positives in column 0).
+    """
+    if batch.numel() == 0:
+        return data
+    if batch.dim() == 3:
+        batch = batch[:, 0, :]
+    if batch.dim() != 2 or batch.size(-1) != 3:
+        raise ValueError(f"mask_query_edges expects [B, 3] or [B, N, 3], got {tuple(batch.shape)}")
+    if data.num_relations < 2 or data.num_relations % 2:
+        raise ValueError(
+            f"Cannot infer inverse relation IDs from num_relations={data.num_relations}"
+        )
+    h_index, t_index, r_index = batch.t()
+    base = data.num_relations // 2
+    inverse_r = torch.where(r_index < base, r_index + base, r_index - base)
+    h_ext = torch.cat([h_index, t_index], dim=-1)
+    t_ext = torch.cat([t_index, h_index], dim=-1)
+    r_ext = torch.cat([r_index, inverse_r], dim=-1)
+    graph_edges = torch.cat([data.edge_index, data.edge_type.unsqueeze(0)])
+    query_edges = torch.stack([h_ext, t_ext, r_ext])
+    matched_index = edge_match(graph_edges, query_edges)[0]
+    keep = torch.ones(data.edge_index.size(1), dtype=torch.bool, device=data.edge_index.device)
+    if matched_index.numel() > 0:
+        keep[matched_index] = False
+    masked = copy.copy(data)
+    masked.edge_index = data.edge_index[:, keep]
+    masked.edge_type = data.edge_type[keep]
+    return masked
+
+
+def make_filtered_ranking_graph(*graphs, num_nodes: int | None = None):
+    """Build the filtered-ranking graph: observed edges plus all split targets.
+
+    Transductive eval should pass train / valid / test graphs so valid facts
+    are not treated as competitors. Graphs with a different ``num_nodes``
+    (inductive train vs inference) are skipped when adding targets.
+    Inverse targets are added when ``num_relations`` is even.
+    """
+    graphs = [g for g in graphs if g is not None]
+    if not graphs:
+        raise ValueError("make_filtered_ranking_graph needs at least one graph")
+    base = graphs[0]
+    num_nodes = int(num_nodes if num_nodes is not None else base.num_nodes)
+    idxs = [base.edge_index]
+    types = [base.edge_type]
+    for g in graphs:
+        if int(getattr(g, "num_nodes", -1)) != num_nodes:
+            continue
+        tgt_i = getattr(g, "target_edge_index", None)
+        tgt_t = getattr(g, "target_edge_type", None)
+        if tgt_i is None or tgt_t is None or tgt_i.numel() == 0:
+            continue
+        idxs.append(tgt_i)
+        types.append(tgt_t)
+        nrel = int(getattr(g, "num_relations", 0) or 0)
+        if nrel >= 2 and nrel % 2 == 0:
+            idxs.append(tgt_i.flip(0))
+            types.append(tgt_t + nrel // 2)
+    return Data(
+        edge_index=torch.cat(idxs, dim=1),
+        edge_type=torch.cat(types),
+        num_nodes=num_nodes,
+    )
+
+
 def strict_negative_mask(data, batch):
     # this function makes sure that for a given (h, r) batch we will NOT sample true tails as random negatives
     # similarly, for a given (t, r) we will NOT sample existing true heads as random negatives
@@ -257,10 +345,10 @@ def build_relation_graph(graph):
     Aht = torch.sparse.mm(EhT, Et).coalesce()
     Ath = torch.sparse.mm(EtT, Eh).coalesce()
 
-    hh_edges = torch.cat([Ahh.indices().T, torch.zeros(Ahh.indices().T.shape[0], 1, dtype=torch.long).fill_(0)], dim=1)  # head to head
-    tt_edges = torch.cat([Att.indices().T, torch.zeros(Att.indices().T.shape[0], 1, dtype=torch.long).fill_(1)], dim=1)  # tail to tail
-    ht_edges = torch.cat([Aht.indices().T, torch.zeros(Aht.indices().T.shape[0], 1, dtype=torch.long).fill_(2)], dim=1)  # head to tail
-    th_edges = torch.cat([Ath.indices().T, torch.zeros(Ath.indices().T.shape[0], 1, dtype=torch.long).fill_(3)], dim=1)  # tail to head
+    hh_edges = torch.cat([Ahh.indices().T, torch.zeros(Ahh.indices().T.shape[0], 1, dtype=torch.long, device=device).fill_(0)], dim=1)  # head to head
+    tt_edges = torch.cat([Att.indices().T, torch.zeros(Att.indices().T.shape[0], 1, dtype=torch.long, device=device).fill_(1)], dim=1)  # tail to tail
+    ht_edges = torch.cat([Aht.indices().T, torch.zeros(Aht.indices().T.shape[0], 1, dtype=torch.long, device=device).fill_(2)], dim=1)  # head to tail
+    th_edges = torch.cat([Ath.indices().T, torch.zeros(Ath.indices().T.shape[0], 1, dtype=torch.long, device=device).fill_(3)], dim=1)  # tail to head
     
     rel_graph = Data(
         edge_index=torch.cat([hh_edges[:, [0, 1]].T, tt_edges[:, [0, 1]].T, ht_edges[:, [0, 1]].T, th_edges[:, [0, 1]].T], dim=1), 
@@ -589,6 +677,7 @@ def _sample_meta_context(
     num_nodes: int,
     forbidden_hrt: set[tuple[int, int, int]],
     device: torch.device,
+    allowed_nodes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     从 h_anchor 的 k-hop (k=1,2,3) 出射子图中采集 meta-context 三元组。
@@ -669,7 +758,10 @@ def _sample_meta_context(
         max_tries = max(1000, num_pad * 50)
         while len(pad_triples) < num_pad and tries < max_tries:
             tries += 1
-            t_rand = int(torch.randint(0, num_nodes, (1,)).item())
+            if allowed_nodes is not None:
+                t_rand = int(allowed_nodes[torch.randint(0, allowed_nodes.numel(), (1,))].item())
+            else:
+                t_rand = int(torch.randint(0, num_nodes, (1,)).item())
             if t_rand in pad_set:
                 continue
             if (h_anchor, t_rand) in true_pairs:
@@ -682,7 +774,11 @@ def _sample_meta_context(
 
         # Deterministic fallback if random wasn't enough
         if len(pad_triples) < num_pad:
-            for t_cand in torch.randperm(num_nodes).tolist():
+            if allowed_nodes is not None:
+                scan_order = allowed_nodes[torch.randperm(allowed_nodes.numel())].tolist()
+            else:
+                scan_order = torch.randperm(num_nodes).tolist()
+            for t_cand in scan_order:
                 if len(pad_triples) >= num_pad:
                     break
                 if t_cand in pad_set or (h_anchor, t_cand) in true_pairs:
@@ -712,6 +808,7 @@ def build_context_relation_aware(
     num_pos: int,
     num_neg: int,
     num_meta_context: int = 0,
+    component: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     针对 [B, N, 3] 输入，按每行固定 relation=r 构建并复用上下文：
@@ -720,6 +817,10 @@ def build_context_relation_aware(
       3) 若正样本不足 num_pos，缺口自动并入负样本数量；
       4) 负样本：采样 (x, y, r) 且在图中不存在；
       5) 去重，且不能包含当前行 [N, 3] 中已有三元组。
+
+    若提供 ``component``（每个节点的弱连通分量 id，见 episode 划分），则正样本、
+    负样本与 meta-context 补齐都只落在该行 head 所在的连通块内，孤立点因此
+    永远不会进入上下文。
 
     输出每行上下文形状: [num_meta_context + num_pos + num_neg, 3]
     返回长度为 B 的 list，每个 batch 行对应一份上下文。
@@ -752,7 +853,21 @@ def build_context_relation_aware(
         # 约定当前行共享同一个 relation，取第一个作为锚点
         r_anchor = row_relations[0]
 
+        # 获取该行的 anchor head（使用 [B, 0, 3] 即每行第一个三元组的 head）
+        h_anchor = int(batch[i, 0, 0])
+
+        # 连通块约束：只允许落在 h_anchor 所在分量内的节点
+        if component is not None:
+            allowed_mask = component == component[h_anchor]
+            allowed_nodes = allowed_mask.nonzero(as_tuple=False).view(-1).cpu()
+        else:
+            allowed_mask = None
+            allowed_nodes = None
+
         rel_eids = (edge_type == r_anchor).nonzero(as_tuple=False).view(-1)
+        if allowed_mask is not None and rel_eids.numel() > 0:
+            in_comp = allowed_mask[edge_index[0, rel_eids]] & allowed_mask[edge_index[1, rel_eids]]
+            rel_eids = rel_eids[in_comp]
         if rel_eids.numel() == 0:
             true_pairs_r: set[tuple[int, int]] = set()
         else:
@@ -786,9 +901,6 @@ def build_context_relation_aware(
         # ===== 2) 负样本：优先从 head 的 2-hop 子图采样 + 全局随机采样 =====
         neg_candidates: list[tuple[int, int, int]] = []
         neg_set: set[tuple[int, int, int]] = set()
-
-        # 获取该行的 anchor head（使用 [B, 0, 3] 即每行第一个三元组的 head）
-        h_anchor = int(batch[i, 0, 0])
 
         def invalid_neg(h: int, t: int, r: int) -> bool:
             tri = (h, t, r)
@@ -847,7 +959,10 @@ def build_context_relation_aware(
             max_tries = max(1000, remaining * 50)
             while len(neg_candidates) < need_neg and tries < max_tries:
                 tries += 1
-                t_rand = int(torch.randint(0, num_nodes, (1,), device=device).item())
+                if allowed_nodes is not None:
+                    t_rand = int(allowed_nodes[torch.randint(0, allowed_nodes.numel(), (1,))].item())
+                else:
+                    t_rand = int(torch.randint(0, num_nodes, (1,), device=device).item())
                 if invalid_neg(h_anchor, t_rand, r_anchor):
                     continue
                 tri = (h_anchor, t_rand, r_anchor)
@@ -856,7 +971,10 @@ def build_context_relation_aware(
 
         # 2.3 如果还不够，确定性扫描补齐
         if len(neg_candidates) < need_neg:
-            all_nodes = torch.randperm(num_nodes, device=device).tolist()
+            if allowed_nodes is not None:
+                all_nodes = allowed_nodes[torch.randperm(allowed_nodes.numel())].tolist()
+            else:
+                all_nodes = torch.randperm(num_nodes, device=device).tolist()
             for t_candidate in all_nodes:
                 if len(neg_candidates) >= need_neg:
                     break
@@ -883,6 +1001,7 @@ def build_context_relation_aware(
                 num_nodes=num_nodes,
                 forbidden_hrt=forbidden_row_hrt,
                 device=device,
+                allowed_nodes=allowed_nodes,
             )
         else:
             meta_triples = torch.empty((0, 3), dtype=torch.long, device=device)

@@ -352,6 +352,8 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
 
     loss_type = str(cfg.task.get("loss_type", "bce")).strip().lower()
     label_smoothing = float(cfg.task.get("label_smoothing", 0.0))
+    # 每条三元组额外训练一条 (t, r^-1, ?) 反向 query，实际 batch 变为 2 倍
+    train_inverse = bool(cfg.task.get("train_inverse", True))
     if loss_type == "softmax":
         softmax_loss_fn = LabelSmoothingLoss(smoothing=label_smoothing, reduction="mean")
     if util.get_rank() == 0:
@@ -368,6 +370,10 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
             losses = []
             sampler.set_epoch(epoch)
             for batch in islice(train_loader, batch_per_epoch):
+                # 0) 每条三元组配一条反向 query，让 head / tail 两侧共享同一次更新
+                if train_inverse:
+                    batch = tasks.augment_with_inverse_queries(train_data, batch)
+
                 # 1) 负采样得到 (B, N, 3) 的 query 三元组
                 batch_neg = tasks.negative_sampling_tail(
                     train_data,
@@ -825,20 +831,22 @@ if __name__ == "__main__":
     
     # 单图数据集：直接使用 dataset[0], dataset[1], dataset[2]
     train_data, valid_data, test_data = dataset[0], dataset[1], dataset[2]
-    
-    if "fast_test" in cfg.train:
-        num_val_edges = cfg.train.fast_test
-        if util.get_rank() == 0:
-            logger.warning(f"Fast evaluation on {num_val_edges} samples in validation")
-        short_valid = copy.deepcopy(test_data)
-        mask = torch.randperm(short_valid.target_edge_index.shape[1])[:num_val_edges]
-        short_valid.target_edge_index = short_valid.target_edge_index[:, mask]
-        short_valid.target_edge_type = short_valid.target_edge_type[mask]
-        short_valid = short_valid.to(device)
-
     train_data = train_data.to(device)
     valid_data = valid_data.to(device)
     test_data = test_data.to(device)
+    # fast_test only shortens the test eval. Training still validates on the full valid split.
+    if "fast_test" in cfg.train:
+        n = int(cfg.train.fast_test)
+        eval_test = copy.deepcopy(test_data)
+        n_edges = eval_test.target_edge_index.shape[1]
+        if n_edges > n:
+            mask = torch.randperm(n_edges)[:n]
+            eval_test.target_edge_index = eval_test.target_edge_index[:, mask]
+            eval_test.target_edge_type = eval_test.target_edge_type[mask]
+        if util.get_rank() == 0:
+            logger.warning("Fast test: %d target triples of the test split", n)
+    else:
+        eval_test = test_data
     model = create_model(
         cfg,
         init=bool(cfg.train.get("init_model", True)),
@@ -899,7 +907,7 @@ if __name__ == "__main__":
         cfg, 
         model, 
         train_data, 
-        valid_data if "fast_test" not in cfg.train else short_valid, 
+        valid_data, 
         device=device,
         logger=logger,
         filtered_data=filtered_data, 
@@ -910,7 +918,7 @@ if __name__ == "__main__":
     test(
         cfg, 
         model, 
-        test_data if "fast_test" not in cfg.train else short_valid,
+        eval_test,
         device=device,
         logger=logger,
         filtered_data=filtered_data, 

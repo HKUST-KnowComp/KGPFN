@@ -39,8 +39,11 @@ python script/download.py --ft limix
 Or directly download a fully pretrained KGPFN model checkpoint:
 
 ```bash
-# tabicl as the pfn architecture (default)
+# tabicl trained on the ULTRA 50g structure encoder (default)
 python script/download.py --kgpfn
+
+# tabicl trained with the ULTRA 3g structure encoder on 3 kg datasets
+python script/download.py --kgpfn icl_3g
 
 # limix as the pfn architecture
 python script/download.py --kgpfn limix

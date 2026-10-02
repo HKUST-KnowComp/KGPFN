@@ -136,6 +136,35 @@ class CustomTabICL(nn.Module):
 
         return out
 
+    def encode_context_rows(self, x_ctx: torch.Tensor, y_ctx: torch.Tensor):
+        """Row-interact context once and bake labels into the cached reps.
+
+        x_ctx: [B, M, F, D], y_ctx: [B, M]
+        Returns (R_ctx, train_size) with y already added to R_ctx.
+        """
+        B, M, _, _ = x_ctx.shape
+        R = self.row_interactor(self.x_adapter(x_ctx))
+        if self.thinking_rows is not None:
+            R, train_size = self.thinking_rows(R, M)
+            y_train = torch.zeros(B, train_size, dtype=y_ctx.dtype, device=y_ctx.device)
+            y_train[:, self.num_thinking_rows:] = y_ctx
+        else:
+            train_size = M
+            y_train = y_ctx
+        R = self.icl_predictor.prepare_repr_cache(R, y_train)
+        return R, train_size
+
+    def score_query_rows(self, x_q: torch.Tensor, R_ctx: torch.Tensor, train_size: int) -> torch.Tensor:
+        """Score query rows against a cached context representation.
+
+        x_q: [B, N, F, D], R_ctx: [B, train_size, icl_dim]
+        Returns [B, N, 1].
+        """
+        R_q = self.row_interactor(self.x_adapter(x_q))
+        R = torch.cat([R_ctx, R_q], dim=1)
+        out = self.icl_predictor._icl_predictions_repr_cache(R, train_size=train_size)
+        return out[:, train_size:]
+
 
 def build_custom_tabicl(config: dict, structure_encoder_dim: int = 64) -> CustomTabICL:
     return CustomTabICL(structure_encoder_dim=structure_encoder_dim, **config)

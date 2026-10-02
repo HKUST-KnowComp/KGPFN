@@ -188,6 +188,123 @@ class StructureEncoderRelationAware(nn.Module):
 
         return score
 
+    def encode_all_tails(self, data, batch, with_relation=True, n_hop=0):
+        """One NBFNet pass per query; keep all-node features and hop states.
+
+        batch: [B, 3] of (h, t_pos, r). Hop states are raw layer outputs
+        (no relation concat), matching ``get_layer_output(..., with_relation=False)``.
+        """
+        assert batch.dim() == 2 and batch.size(-1) == 3
+        bsz = batch.size(0)
+        h_index, _, r_index = batch.t()
+        relation_representations = self.relation_model(data.relation_graph, query=r_index)
+        self.entity_model.query = relation_representations
+        for layer in self.entity_model.layers:
+            layer.relation = relation_representations
+
+        out = self.entity_model.bellmanford(
+            data, h_index, r_index, with_relation=with_relation, return_hiddens=True
+        )
+        feat = out["node_feature"]
+        hiddens = out["hiddens"]
+        row = torch.arange(bsz, device=batch.device)
+        h_emb = feat[row, h_index]
+        r_emb = relation_representations[row, r_index]
+        hops_h, hops_t = [], []
+        for k in range(n_hop):
+            layer_feat = hiddens[k]
+            hops_h.append(layer_feat[row, h_index])
+            hops_t.append(layer_feat)
+        return h_emb, r_emb, feat, hops_h, hops_t
+
+    def encode_seq(self, data, batch, with_relation=True, n_hop=0):
+        """One unique-(h,r) NBFNet pass; gather h/t and hop states for [B, S, 3]."""
+        assert batch.dim() == 3 and batch.size(-1) == 3
+        bsz, seq_len, _ = batch.shape
+        device = batch.device
+
+        query_rels = batch[:, 0, 2]
+        if not (batch[:, :, 2] == query_rels.unsqueeze(1)).all():
+            raise ValueError("encode_seq 要求每行 relation 一致")
+
+        relation_representations = self.relation_model(data.relation_graph, query=query_rels)
+
+        unique_heads_all, unique_rels_all, row_unique_inverse, row_offsets = [], [], [], []
+        offset = 0
+        for i in range(bsz):
+            h_row = batch[i, :, 0]
+            h_unique, h_inv = torch.unique(h_row, sorted=False, return_inverse=True)
+            row_unique_inverse.append(h_inv)
+            row_offsets.append(offset)
+            offset += h_unique.numel()
+            unique_heads_all.append(h_unique)
+            unique_rels_all.append(torch.full_like(h_unique, query_rels[i]))
+
+        flat_h = torch.cat(unique_heads_all, dim=0)
+        flat_r = torch.cat(unique_rels_all, dim=0)
+        row_ids = torch.cat(
+            [
+                torch.full((uh.numel(),), i, dtype=torch.long, device=device)
+                for i, uh in enumerate(unique_heads_all)
+            ],
+            dim=0,
+        )
+        flat_relation_representations = relation_representations[row_ids]
+        global_idx_2d = torch.stack(
+            [row_unique_inverse[i] + row_offsets[i] for i in range(bsz)],
+            dim=0,
+        )
+        h_index = batch[:, :, 0]
+        t_index = batch[:, :, 1]
+        _, _, r_index = batch.unbind(-1)
+        index_r = r_index.unsqueeze(-1).expand(-1, -1, relation_representations.size(-1))
+        r_emb = relation_representations.gather(1, index_r)
+
+        U = flat_h.size(0)
+        chunk_size = self.entity_chunk_size if self.entity_chunk_size is not None else U
+        h_embs = t_embs = None
+        hops_h = [None] * n_hop
+        hops_t = [None] * n_hop
+
+        for start in range(0, U, chunk_size):
+            end = min(start + chunk_size, U)
+            h_chunk = flat_h[start:end]
+            r_chunk = flat_r[start:end]
+            rel_chunk = flat_relation_representations[start:end]
+            self.entity_model.query = rel_chunk
+            for layer in self.entity_model.layers:
+                layer.relation = rel_chunk
+            out = self.entity_model.bellmanford(
+                data, h_chunk, r_chunk, with_relation=with_relation, return_hiddens=True
+            )
+            feat = out["node_feature"]
+            hiddens = out["hiddens"]
+            del out
+
+            if h_embs is None:
+                feat_dim = feat.size(-1)
+                hop_dim = hiddens[0].size(-1) if n_hop > 0 else feat_dim
+                h_embs = feat.new_zeros(bsz, seq_len, feat_dim)
+                t_embs = feat.new_zeros(bsz, seq_len, feat_dim)
+                for k in range(n_hop):
+                    hops_h[k] = feat.new_zeros(bsz, seq_len, hop_dim)
+                    hops_t[k] = feat.new_zeros(bsz, seq_len, hop_dim)
+
+            mask = (global_idx_2d >= start) & (global_idx_2d < end)
+            if mask.any():
+                b_idx, s_idx = mask.nonzero(as_tuple=True)
+                lu = global_idx_2d[b_idx, s_idx] - start
+                h_embs[b_idx, s_idx] = feat[lu, h_index[b_idx, s_idx]]
+                t_embs[b_idx, s_idx] = feat[lu, t_index[b_idx, s_idx]]
+                for k in range(n_hop):
+                    layer_feat = hiddens[k]
+                    hops_h[k][b_idx, s_idx] = layer_feat[lu, h_index[b_idx, s_idx]]
+                    hops_t[k][b_idx, s_idx] = layer_feat[lu, t_index[b_idx, s_idx]]
+
+            del feat, hiddens
+
+        return h_embs, r_emb, t_embs, hops_h, hops_t
+
     def get_layer_output(self, data, batch: torch.Tensor, layer_k: int, with_relation: bool = True, use_tail: bool = False) -> torch.Tensor:
         """
         Run EntityNBFNet up to layer_k (1-indexed) and return head (or tail) entity embeddings.
@@ -389,7 +506,7 @@ class EntityNBFNet(BaseNBFNet):
         self.mlp = nn.Sequential(*mlp)
 
 
-    def bellmanford(self, data, h_index, r_index, separate_grad=False, with_relation=True):
+    def bellmanford(self, data, h_index, r_index, separate_grad=False, with_relation=True, return_hiddens=False):
         batch_size = len(r_index)
 
         # initialize queries (relation types of the given triples)
@@ -437,10 +554,13 @@ class EntityNBFNet(BaseNBFNet):
             else:
                 output = hiddens[-1]
 
-        return {
+        result = {
             "node_feature": output,
             "edge_weights": edge_weights,
         }
+        if return_hiddens:
+            result["hiddens"] = hiddens
+        return result
 
     def forward(self, data, relation_representations, batch, return_score=False):
         h_index, t_index, r_index = batch.unbind(-1)
