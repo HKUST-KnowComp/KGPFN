@@ -1,0 +1,29 @@
+model:
+  structure_encoder: true
+  enhance_structure: true
+  structure_score_enhance: true
+  with_relation: true
+  seq_chunk_size: 40
+  context_graph: 3
+  context_tail: true
+  feature_transformer: tabicl
+  relation_model:
+    class: RelNBFNet
+    input_dim: 64
+    hidden_dims: [64, 64, 64, 64, 64, 64]
+    message_func: distmult
+    aggregate_func: sum
+    short_cut: true
+    layer_norm: true
+  entity_model:
+    class: EntityNBFNet
+    input_dim: 64
+    entity_chunk_size: 64
+    hidden_dims: [64, 64, 64, 64, 64, 64]
+    message_func: distmult
+    aggregate_func: sum
+    short_cut: true
+    layer_norm: true
+  semantic_encoder:
+    model_name: none
+    dim: 384
